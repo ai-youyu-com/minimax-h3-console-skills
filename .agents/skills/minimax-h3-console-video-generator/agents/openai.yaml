@@ -1,0 +1,11 @@
+interface:
+  display_name: "MiniMax H3 Console Video Generator"
+  short_description: "Submit and track H3 video jobs through the console MCP"
+  default_prompt: "Use $minimax-h3-console-video-generator to generate this video from my prompt and reference assets."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "minimax_h3_console"
+      description: "Upload reference images and submit or manage MiniMax H3 video tasks"
+policy:
+  allow_implicit_invocation: true
