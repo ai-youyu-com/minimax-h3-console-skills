@@ -7,6 +7,16 @@ description: Generate, submit, inspect, retry, cancel, and follow MiniMax H3 vid
 
 Use the `minimax_h3_console` MCP as the system of record for workspaces, uploaded assets, task submission, and task status.
 
+## MCP availability
+
+Before handling any console operation, confirm that the `minimax_h3_console` MCP is available in the current project. If it is unavailable, do not attempt uploads, submissions, status checks, retries, or cancellations. Tell the user to:
+
+1. Open [MiniMax H3 Console MCP settings](https://minimax.beetag.cc/settings/mcp).
+2. Create an MCP token.
+3. Copy the generated MCP link and add it to the current project to install the MCP.
+
+After giving these instructions, stop the console workflow until the MCP has been installed. Never ask the user to paste the token or MCP link into the conversation.
+
 ## Route the request
 
 - A request to generate or submit a video authorizes creation of one intended video task after its inputs pass validation.
