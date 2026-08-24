@@ -13,9 +13,9 @@ Before handling any console operation, confirm that the `minimax_h3_console` MCP
 
 1. Open [MiniMax H3 Console MCP settings](https://minimax.beetag.cc/settings/mcp).
 2. Create an MCP token.
-3. Copy the generated MCP link and add it to the current project to install the MCP.
+3. Copy the generated MCP link and paste it into the current conversation so it can be installed in the current project.
 
-After giving these instructions, stop the console workflow until the MCP has been installed. Never ask the user to paste the token or MCP link into the conversation.
+After giving these instructions, stop the console workflow until the user provides the MCP link and the MCP has been installed.
 
 ## Route the request
 
@@ -40,7 +40,7 @@ Read [references/console-workflow.md](references/console-workflow.md) before upl
 
 ## Operational rules
 
-- Never expose presigned upload URLs or security tokens in user-facing output.
+- Never expose presigned upload URLs in user-facing output.
 - Put stable file identity in upload metadata and task-specific semantics in `reference_description`. This enables reuse and prevents hash/metadata conflicts.
 - Do not change quality, duration, mode, prompt content, reference mapping, or target machine while retrying an identical request.
 - Do not automatically create a replacement task after a definitive failure. Inspect the error and ask or explain when correction would materially alter the request.
