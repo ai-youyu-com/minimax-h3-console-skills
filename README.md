@@ -26,19 +26,19 @@ MiniMax H3 的提示词规范和创作类 Skills 来源于 [MiniMax-AI/MiniMax-H
 在目标项目目录中执行：
 
 ```bash
-npx skills add ai-youyu-com/minimax-h3-jobs --skill minimax-h3-console-video-generator
+npx skills add ai-youyu-com/minimax-h3-console-skills --skill minimax-h3-console-video-generator
 ```
 
 `npx skills` 会检测当前环境中的 Agent，并询问安装目标。若要直接安装给 Codex：
 
 ```bash
-npx skills add ai-youyu-com/minimax-h3-jobs --skill minimax-h3-console-video-generator --agent codex
+npx skills add ai-youyu-com/minimax-h3-console-skills --skill minimax-h3-console-video-generator --agent codex
 ```
 
 如果希望全局安装，使所有项目都能使用，可增加 `--global`：
 
 ```bash
-npx skills add ai-youyu-com/minimax-h3-jobs --skill minimax-h3-console-video-generator --agent codex --global
+npx skills add ai-youyu-com/minimax-h3-console-skills --skill minimax-h3-console-video-generator --agent codex --global
 ```
 
 ### 2. 安装 MiniMax 官方完整 Skill 集
