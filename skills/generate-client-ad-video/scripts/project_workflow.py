@@ -21,7 +21,7 @@ from typing import Any
 BRIEF_NAME = "ad-brief.md"
 SUPPORTED_IMAGES = {".png", ".jpg", ".jpeg", ".webp"}
 REPLACEMENT_STEM = "approved-keyframe"
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 CANDIDATE_IDS = tuple(str(index) for index in range(1, 6))
 SCRIPT_CANDIDATE_FIELDS = {
     "candidate_id",
@@ -42,6 +42,9 @@ ALLOWED_STAGES = {
     "succeeded",
     "failed",
     "cancelled",
+    "proposal_review",
+    "proposal_locked",
+    "production_ready",
 }
 TRANSITIONS = {
     "script_review": {"cancelled"},
@@ -52,6 +55,9 @@ TRANSITIONS = {
     "failed": {"task_review", "cancelled"},
     "succeeded": set(),
     "cancelled": set(),
+    "proposal_review": {"proposal_locked", "cancelled"},
+    "proposal_locked": {"production_ready", "proposal_review", "cancelled"},
+    "production_ready": {"submitted", "proposal_review", "cancelled"},
 }
 ARTIFACT_KINDS = {
     "script",
@@ -63,6 +69,15 @@ ARTIFACT_KINDS = {
     "request",
     "request-validation",
     "task-result",
+    "client-feedback",
+    "dimension-reference",
+    "dimension-reference-image",
+    "aggregate-keyframe-prompt",
+    "aggregate-keyframe",
+    "proposal-package",
+    "production-package",
+    "asset-upload",
+    "retry-authorization",
 }
 SENSITIVE_KEYS = {
     "authorization",
@@ -586,11 +601,11 @@ def start_run(project: Path, run_id: str | None = None) -> dict[str, Any]:
         "schema_version": CURRENT_SCHEMA_VERSION,
         "run_id": run_id,
         "project_dir": inspection["project_dir"],
-        "stage": "script_review",
+        "stage": "proposal_review",
         "created_at": created,
         "updated_at": created,
         "artifacts": {},
-        "history": [{"at": created, "event": "run_started", "stage": "script_review"}],
+        "history": [{"at": created, "event": "run_started", "stage": "proposal_review"}],
     }
     atomic_json_write(state_path, state)
     return {"run_dir": str(run_dir.resolve()), "manifest": str(manifest_path), "state": state}
@@ -658,6 +673,126 @@ def validate_script_set(path: Path) -> tuple[str, ...]:
     if tuple(ids) != CANDIDATE_IDS:
         raise WorkflowError("script candidates 必须按 1、2、3、4、5 排列且不得重复")
     return tuple(ids)
+
+
+def validate_dimension_reference(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise WorkflowError(f"dimension-reference 必须是有效 JSON: {exc}") from exc
+    if not isinstance(payload, dict) or payload.get("status") not in {"provided", "missing"}:
+        raise WorkflowError("dimension-reference.status 必须是 provided 或 missing")
+    if payload["status"] == "missing":
+        if payload.get("measurements") not in (None, [], {}):
+            raise WorkflowError("尺寸缺失时不得包含推测的 measurements")
+        if payload.get("not_to_scale") is not True:
+            raise WorkflowError("尺寸缺失时必须设置 not_to_scale: true")
+        if payload.get("display_disclaimer") != "尺寸未提供 / 非按比例":
+            raise WorkflowError("尺寸缺失时必须设置 display_disclaimer: 尺寸未提供 / 非按比例")
+    else:
+        measurements = payload.get("measurements")
+        if not isinstance(measurements, list) or not measurements:
+            raise WorkflowError("已提供尺寸时 measurements 必须是非空数组")
+        for item in measurements:
+            if not isinstance(item, dict) or not all(item.get(key) not in (None, "") for key in ("model", "unit", "source")):
+                raise WorkflowError("每条尺寸必须包含 model、unit 和 source")
+            if not any(item.get(key) not in (None, "") for key in ("length", "width", "height", "diameter")):
+                raise WorkflowError("每条尺寸至少需要长宽高或直径中的一个值")
+    return payload
+
+
+def validate_feedback_payload(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise WorkflowError(f"client-feedback 必须是有效 JSON: {exc}") from exc
+    required = ("raw_reply", "received_at", "channel", "change_items")
+    if not isinstance(payload, dict) or any(payload.get(field) in (None, "") for field in required):
+        raise WorkflowError("client-feedback 必须包含 raw_reply、received_at、channel 和 change_items")
+    if not isinstance(payload["change_items"], list):
+        raise WorkflowError("client-feedback.change_items 必须是数组")
+    if "affects_visuals" not in payload or not isinstance(payload["affects_visuals"], bool):
+        raise WorkflowError("client-feedback.affects_visuals 必须是布尔值")
+    return payload
+
+
+def proposal_entry(state: dict[str, Any], revision: int | None = None) -> dict[str, Any]:
+    entries = state.get("artifacts", {}).get("proposal-package", [])
+    if revision is None:
+        if not entries:
+            raise WorkflowError("缺少 proposal-package")
+        return entries[-1]
+    for entry in entries:
+        if entry.get("proposal_revision") == revision:
+            return entry
+    raise WorkflowError(f"找不到提案包 V{revision:02d}")
+
+
+def component_binding(entry: dict[str, Any]) -> dict[str, Any]:
+    verify_artifact_integrity(entry, "proposal component")
+    return {"version": entry["version"], "path": entry["path"], "sha256": entry["sha256"]}
+
+
+def verify_proposal_components(proposal: dict[str, Any]) -> dict[str, Any]:
+    payload = read_json_artifact(proposal, "proposal-package")
+    components = payload.get("components")
+    if not isinstance(components, dict):
+        raise WorkflowError("proposal-package 缺少 components")
+    for name in ("script", "dimension_reference", "dimension_reference_image", "aggregate_keyframe"):
+        binding = components.get(name)
+        if not isinstance(binding, dict):
+            raise WorkflowError(f"proposal-package 缺少组件绑定: {name}")
+        verify_artifact_integrity(binding, f"proposal component {name}")
+    feedback = payload.get("client_feedback")
+    if feedback is not None:
+        verify_artifact_integrity(feedback, "proposal client feedback")
+    return payload
+
+
+def validate_v3_task_preview(payload: dict[str, Any]) -> None:
+    errors: list[str] = []
+    if payload.get("mode") != "i2v":
+        errors.append("mode 必须是 i2v")
+    if not is_uuid(payload.get("workspace_id")):
+        errors.append("workspace_id 必须是 UUID")
+    if not is_uuid(payload.get("idempotency_key")):
+        errors.append("idempotency_key 必须是 UUID")
+    duration = payload.get("duration_seconds")
+    if isinstance(duration, bool) or not isinstance(duration, (int, float)) or not 4 <= duration <= 15:
+        errors.append("duration_seconds 必须在 4 到 15 秒之间")
+    if payload.get("aspect_ratio") not in {"16:9", "9:16", "1:1"}:
+        errors.append("aspect_ratio 无效")
+    if payload.get("quality") not in {"high", "standard"}:
+        errors.append("quality 无效")
+    if not isinstance(payload.get("execution_backend"), str) or not payload["execution_backend"].strip():
+        errors.append("execution_backend 不能为空")
+    if errors:
+        raise WorkflowError("task-preview 校验失败: " + "; ".join(errors))
+
+
+def render_proposal_markdown(
+    revision: int,
+    scripts: dict[str, Any],
+    dimensions: dict[str, Any],
+    dimension_image_name: str,
+    keyframe_name: str,
+) -> str:
+    lines = [f"# 客户提案包 V{revision}", "", "## 脚本方案", "", "| ID | 创意方向 | 钩子 | 时间轴分镜 | 口播 | 素材映射 | 后期文字 |", "|---|---|---|---|---|---|---|"]
+    for item in scripts["candidates"]:
+        def cell(value: Any) -> str:
+            if isinstance(value, list):
+                value = "<br>".join(str(part) for part in value)
+            elif isinstance(value, dict):
+                value = json.dumps(value, ensure_ascii=False)
+            return str(value).replace("|", "\\|").replace("\n", "<br>")
+        lines.append("| " + " | ".join(cell(item[field]) for field in ("candidate_id", "creative_direction", "hook", "storyboard", "voiceover", "source_mapping", "post_production_text")) + " |")
+    lines.extend(["", "## 产品尺寸参考", ""])
+    if dimensions["status"] == "missing":
+        lines.extend(["> 尺寸未提供 / 非按比例。不得根据普通照片或像素推算实物尺寸。", ""])
+    else:
+        lines.extend(["尺寸数据来自客户明确提供的来源；参考图仅按已记录数据表达。", ""])
+    lines.extend([f"![产品尺寸参考]({dimension_image_name})", "", "## 总聚合关键帧", "", f"![总聚合关键帧]({keyframe_name})", ""])
+    return "\n".join(lines)
 
 
 def artifact_entry_for_candidate(
@@ -791,6 +926,285 @@ def validate_task_preview(
     return payload
 
 
+def record_feedback(run_dir: Path, proposal_version: int, source: Path) -> dict[str, Any]:
+    state_path, state = load_state(run_dir)
+    if schema_version(state) != 3:
+        raise WorkflowError("record-feedback 仅适用于 schema v3")
+    proposal = proposal_entry(state, proposal_version)
+    payload = validate_feedback_payload(source)
+    declared = payload.get("proposal_revision", proposal_version)
+    if declared != proposal_version:
+        raise WorkflowError("反馈中的 proposal_revision 与目标提案版本不一致")
+    payload["proposal_revision"] = proposal_version
+    entries = state.setdefault("artifacts", {}).setdefault("client-feedback", [])
+    version = len(entries) + 1
+    destination = run_dir.resolve() / f"client-feedback-v{version:02d}.json"
+    if destination.exists():
+        raise WorkflowError(f"产物目标已存在: {destination}")
+    atomic_json_write(destination, payload)
+    timestamp = now_iso()
+    entry = {"version": version, "path": str(destination), "sha256": sha256_file(destination), "recorded_at": timestamp, "proposal_revision": proposal_version, "affects_visuals": payload["affects_visuals"]}
+    entries.append(entry)
+    state["updated_at"] = timestamp
+    state.setdefault("history", []).append({"at": timestamp, "event": "client_feedback_recorded", "version": version, "proposal_revision": proposal_version})
+    atomic_json_write(state_path, state)
+    return entry
+
+
+def begin_revision(run_dir: Path, base_revision: int, feedback_version: int) -> dict[str, Any]:
+    state_path, state = load_state(run_dir)
+    if schema_version(state) != 3:
+        raise WorkflowError("begin-revision 仅适用于 schema v3")
+    proposal_entry(state, base_revision)
+    feedback = artifact_entry(state, "client-feedback", feedback_version)
+    if feedback.get("proposal_revision") != base_revision:
+        raise WorkflowError("反馈版本不属于指定的基础提案")
+    if state.get("stage") not in {"proposal_review", "proposal_locked", "production_ready", "submitted", "monitoring", "succeeded", "failed"}:
+        raise WorkflowError("当前阶段不能开始新提案修订")
+    state["active_revision"] = {"base_revision": base_revision, "feedback_version": feedback_version, "started_at": now_iso()}
+    state["stage"] = "proposal_review"
+    state["updated_at"] = now_iso()
+    state.setdefault("history", []).append({"at": state["updated_at"], "event": "proposal_revision_started", "base_revision": base_revision, "feedback_version": feedback_version})
+    atomic_json_write(state_path, state)
+    return state
+
+
+def finalize_proposal(
+    run_dir: Path,
+    script_version: int,
+    dimension_version: int,
+    dimension_image_version: int,
+    keyframe_version: int,
+    base_revision: int | None = None,
+) -> dict[str, Any]:
+    state_path, state = load_state(run_dir)
+    if schema_version(state) != 3 or state.get("stage") != "proposal_review":
+        raise WorkflowError("finalize-proposal 只能在 schema v3 的 proposal_review 阶段执行")
+    script = artifact_entry(state, "script", script_version)
+    dimension = artifact_entry(state, "dimension-reference", dimension_version)
+    dimension_image = artifact_entry(state, "dimension-reference-image", dimension_image_version)
+    keyframe = artifact_entry(state, "aggregate-keyframe", keyframe_version)
+    scripts_payload = read_json_artifact(script, "script")
+    validate_script_set(Path(script["path"]))
+    dimensions_payload = validate_dimension_reference(verify_artifact_integrity(dimension, "dimension-reference"))
+    if dimension_image.get("dimension_version") != dimension["version"]:
+        raise WorkflowError("尺寸参考图未绑定所选 dimension-reference 版本")
+    for entry, label in ((dimension_image, "dimension-reference-image"), (keyframe, "aggregate-keyframe")):
+        path = verify_artifact_integrity(entry, label)
+        if path.suffix.casefold() not in SUPPORTED_IMAGES:
+            raise WorkflowError(f"{label} 必须是支持的图片格式")
+
+    active = state.get("active_revision") or {}
+    if base_revision is None:
+        base_revision = active.get("base_revision")
+    feedback_version = active.get("feedback_version") if base_revision is not None else None
+    existing_proposals = state.get("artifacts", {}).get("proposal-package", [])
+    if base_revision is not None:
+        base = proposal_entry(state, base_revision)
+        if not feedback_version:
+            raise WorkflowError("发布修订版前必须先记录并绑定客户反馈")
+        feedback = artifact_entry(state, "client-feedback", feedback_version)
+        verify_artifact_integrity(feedback, "client-feedback")
+        if feedback.get("proposal_revision") != base_revision:
+            raise WorkflowError("当前反馈不属于基础提案")
+        base_payload = read_json_artifact(base, "proposal-package")
+        if feedback.get("affects_visuals") and base_payload["components"]["aggregate_keyframe"]["version"] == keyframe_version:
+            raise WorkflowError("视觉相关反馈必须使用新的总聚合关键帧")
+    else:
+        base = None
+        feedback = None
+
+    components = {
+        "script": component_binding(script),
+        "dimension_reference": component_binding(dimension),
+        "dimension_reference_image": component_binding(dimension_image),
+        "aggregate_keyframe": component_binding(keyframe),
+    }
+    signature = (base_revision, feedback_version, tuple((name, value["sha256"]) for name, value in components.items()))
+    for entry in state.get("artifacts", {}).get("proposal-package", []):
+        payload = read_json_artifact(entry, "proposal-package")
+        existing = (payload.get("parent_revision"), payload.get("feedback_version"), tuple((name, value["sha256"]) for name, value in payload.get("components", {}).items()))
+        if existing == signature:
+            return entry
+    if existing_proposals and base_revision is None:
+        raise WorkflowError("V2/V3 必须通过 begin-revision 绑定基础提案和客户反馈")
+
+    revision = len(state.get("artifacts", {}).get("proposal-package", [])) + 1
+    if base_revision is not None and base_revision >= revision:
+        raise WorkflowError("base-revision 必须指向早于新版本的提案")
+    proposals_root = run_dir.resolve() / "proposals"
+    final_dir = proposals_root / f"V{revision:02d}"
+    temp_dir = proposals_root / f".V{revision:02d}-{uuid.uuid4().hex}.tmp"
+    proposals_root.mkdir(exist_ok=True)
+    if final_dir.exists():
+        raise WorkflowError(f"提案目录已存在: {final_dir}")
+    temp_dir.mkdir()
+    try:
+        dim_json_name = "dimension-reference.json"
+        dim_image_name = "dimension-reference" + Path(dimension_image["path"]).suffix.casefold()
+        keyframe_name = "aggregate-keyframe" + Path(keyframe["path"]).suffix.casefold()
+        shutil.copy2(dimension["path"], temp_dir / dim_json_name)
+        shutil.copy2(dimension_image["path"], temp_dir / dim_image_name)
+        shutil.copy2(keyframe["path"], temp_dir / keyframe_name)
+        (temp_dir / "proposal.md").write_text(render_proposal_markdown(revision, scripts_payload, dimensions_payload, dim_image_name, keyframe_name), encoding="utf-8")
+        package = {
+            "schema_version": 3,
+            "proposal_revision": revision,
+            "parent_revision": base_revision,
+            "feedback_version": feedback_version,
+            "client_feedback": component_binding(feedback) if feedback is not None else None,
+            "source_manifest_sha256": sha256_file(run_dir.resolve() / "manifest.json"),
+            "components": components,
+            "dimension_status": dimensions_payload["status"],
+            "keyframe_reuse": bool(base and read_json_artifact(base, "proposal-package")["components"]["aggregate_keyframe"]["sha256"] == keyframe["sha256"]),
+            "keyframe_reuse_reason": "纯文字反馈不影响视觉" if base and feedback and not feedback.get("affects_visuals") and read_json_artifact(base, "proposal-package")["components"]["aggregate_keyframe"]["sha256"] == keyframe["sha256"] else None,
+            "deliverables": {"proposal_markdown": "proposal.md", "dimension_data": dim_json_name, "dimension_image": dim_image_name, "aggregate_keyframe": keyframe_name},
+            "created_at": now_iso(),
+        }
+        atomic_json_write(temp_dir / "manifest.json", package)
+        temp_dir.replace(final_dir)
+    except Exception:
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+        raise
+
+    entries = state.setdefault("artifacts", {}).setdefault("proposal-package", [])
+    version = len(entries) + 1
+    manifest_path = final_dir / "manifest.json"
+    run_manifest = run_dir.resolve() / f"proposal-package-v{version:02d}.json"
+    shutil.copy2(manifest_path, run_manifest)
+    timestamp = now_iso()
+    entry = {"version": version, "proposal_revision": revision, "path": str(run_manifest), "deliverable_dir": str(final_dir), "sha256": sha256_file(run_manifest), "recorded_at": timestamp}
+    entries.append(entry)
+    state.pop("active_revision", None)
+    state["updated_at"] = timestamp
+    state.setdefault("history", []).append({"at": timestamp, "event": "proposal_finalized", "proposal_revision": revision})
+    atomic_json_write(state_path, state)
+    return entry
+
+
+def lock_proposal(run_dir: Path, proposal_version: int, candidate_id: str, approval_json: Path) -> dict[str, Any]:
+    state_path, state = load_state(run_dir)
+    if schema_version(state) != 3 or state.get("stage") != "proposal_review":
+        raise WorkflowError("lock-proposal 只能在 schema v3 的 proposal_review 阶段执行")
+    proposal = proposal_entry(state, proposal_version)
+    candidate_id = validate_candidate_id(candidate_id)
+    try:
+        audit = json.loads(approval_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise WorkflowError(f"approval-json 必须是有效 JSON: {exc}") from exc
+    required = ("raw_reply", "confirmed_at", "channel")
+    if not isinstance(audit, dict) or any(audit.get(field) in (None, "") for field in required):
+        raise WorkflowError("确认审计必须包含 raw_reply、confirmed_at 和 channel")
+    if audit.get("create_task_authorized") is not True:
+        raise WorkflowError("最终确认必须明确 create_task_authorized: true")
+    declared_revision = audit.get("proposal_revision", proposal_version)
+    declared_candidate = str(audit.get("candidate_id", candidate_id))
+    if declared_revision != proposal_version or declared_candidate != candidate_id:
+        raise WorkflowError("确认审计中的提案版本或候选 ID 与命令不一致")
+    verify_artifact_integrity(proposal, "proposal-package")
+    verify_proposal_components(proposal)
+    timestamp = now_iso()
+    lock_id = str(uuid.uuid4())
+    lock = {"lock_id": lock_id, "at": timestamp, "proposal_revision": proposal_version, "proposal_package_version": proposal["version"], "proposal_package_sha256": proposal["sha256"], "candidate_id": candidate_id, "audit": sanitize_json({**audit, "proposal_revision": proposal_version, "candidate_id": candidate_id, "create_task_authorized": True})}
+    state.setdefault("proposal_locks", []).append(lock)
+    state.setdefault("approvals", {})["proposal"] = lock
+    state["stage"] = "proposal_locked"
+    state["updated_at"] = timestamp
+    state.setdefault("history", []).append({"at": timestamp, "event": "proposal_locked", "lock_id": lock_id, "proposal_revision": proposal_version, "candidate_id": candidate_id})
+    atomic_json_write(state_path, state)
+    return state
+
+
+def finalize_production(run_dir: Path) -> dict[str, Any]:
+    state_path, state = load_state(run_dir)
+    if schema_version(state) != 3 or state.get("stage") != "proposal_locked":
+        raise WorkflowError("finalize-production 只能在 proposal_locked 阶段执行")
+    lock = state.get("approvals", {}).get("proposal")
+    if not lock or lock.get("audit", {}).get("create_task_authorized") is not True:
+        raise WorkflowError("缺少授权创建一次视频任务的有效提案锁")
+    proposal = proposal_entry(state, lock["proposal_revision"])
+    verify_artifact_integrity(proposal, "proposal-package")
+    proposal_payload = verify_proposal_components(proposal)
+    if proposal["sha256"] != lock["proposal_package_sha256"]:
+        raise WorkflowError("锁定提案哈希与当前提案包不一致")
+    h3_prompt = artifact_entry(state, "h3-prompt")
+    for field, expected in {
+        "proposal_lock_id": lock["lock_id"],
+        "proposal_revision": lock["proposal_revision"],
+        "proposal_package_sha256": lock["proposal_package_sha256"],
+        "candidate_id": lock["candidate_id"],
+    }.items():
+        if h3_prompt.get(field) != expected:
+            raise WorkflowError(f"h3-prompt.{field} 未绑定当前提案锁")
+    validation = artifact_entry(state, "h3-validation")
+    validation_payload = read_json_artifact(validation, "h3-validation")
+    if not validation_payload.get("valid") or validation_payload.get("prompt_sha256") != h3_prompt.get("sha256"):
+        raise WorkflowError("H3 prompt 缺少匹配的成功校验")
+    preview = artifact_entry(state, "task-preview")
+    preview_payload = read_json_artifact(preview, "task-preview")
+    validate_v3_task_preview(preview_payload)
+    retry = state.get("active_retry")
+    if retry:
+        if preview.get("retry_authorization_version") != retry["authorization_version"]:
+            raise WorkflowError("显式重试必须记录新的 task-preview")
+        if preview_payload.get("idempotency_key") == retry.get("prior_idempotency_key"):
+            raise WorkflowError("显式重试必须使用新的 idempotency_key")
+    required_binding = {"proposal_lock_id": lock["lock_id"], "proposal_revision": lock["proposal_revision"], "proposal_package_sha256": lock["proposal_package_sha256"], "candidate_id": lock["candidate_id"], "h3_prompt_version": h3_prompt["version"]}
+    for field, expected in required_binding.items():
+        if preview_payload.get(field) != expected:
+            raise WorkflowError(f"task-preview.{field} 未绑定锁定提案")
+    if not is_uuid(preview_payload.get("idempotency_key")):
+        raise WorkflowError("task-preview.idempotency_key 必须是 UUID")
+    entries = state.setdefault("artifacts", {}).setdefault("production-package", [])
+    version = len(entries) + 1
+    destination = run_dir.resolve() / f"production-package-v{version:02d}.json"
+    payload = {"schema_version": 3, "production_package_version": version, **required_binding, "proposal_package_version": proposal["version"], "aggregate_keyframe": proposal_payload["components"]["aggregate_keyframe"], "h3_prompt": component_binding(h3_prompt), "h3_validation": component_binding(validation), "task_preview": component_binding(preview), "task_parameters": preview_payload, "idempotency_key": preview_payload["idempotency_key"], "created_at": now_iso()}
+    atomic_json_write(destination, payload)
+    timestamp = now_iso()
+    entry = {"version": version, "path": str(destination), "sha256": sha256_file(destination), "recorded_at": timestamp, **required_binding}
+    entries.append(entry)
+    state["stage"] = "production_ready"
+    state.pop("active_retry", None)
+    state["updated_at"] = timestamp
+    state.setdefault("history", []).append({"at": timestamp, "event": "production_finalized", "version": version, "proposal_lock_id": lock["lock_id"]})
+    atomic_json_write(state_path, state)
+    return entry
+
+
+def authorize_retry(run_dir: Path, approval_json: Path) -> dict[str, Any]:
+    state_path, state = load_state(run_dir)
+    if schema_version(state) != 3 or state.get("stage") != "failed":
+        raise WorkflowError("authorize-retry 只能用于 schema v3 的 failed 阶段")
+    lock = state.get("approvals", {}).get("proposal")
+    if not lock:
+        raise WorkflowError("显式重试缺少原提案锁")
+    try:
+        audit = json.loads(approval_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise WorkflowError(f"retry approval 必须是有效 JSON: {exc}") from exc
+    if not isinstance(audit, dict) or any(audit.get(field) in (None, "") for field in ("raw_reply", "confirmed_at", "channel")):
+        raise WorkflowError("重试审计必须包含 raw_reply、confirmed_at 和 channel")
+    if audit.get("retry_authorized") is not True:
+        raise WorkflowError("重试审计必须明确 retry_authorized: true")
+    entries = state.setdefault("artifacts", {}).setdefault("retry-authorization", [])
+    version = len(entries) + 1
+    destination = run_dir.resolve() / f"retry-authorization-v{version:02d}.json"
+    payload = sanitize_json({**audit, "proposal_lock_id": lock["lock_id"], "prior_task_id": state.get("task", {}).get("task_id"), "retry_authorized": True})
+    atomic_json_write(destination, payload)
+    timestamp = now_iso()
+    entries.append({"version": version, "path": str(destination), "sha256": sha256_file(destination), "recorded_at": timestamp, "proposal_lock_id": lock["lock_id"]})
+    prior_production = state.get("artifacts", {}).get("production-package", [])
+    prior_idempotency = read_json_artifact(prior_production[-1], "production-package").get("idempotency_key") if prior_production else None
+    state["active_retry"] = {"authorization_version": version, "prior_idempotency_key": prior_idempotency, "authorized_at": timestamp}
+    state["stage"] = "proposal_locked"
+    state.pop("task", None)
+    state["updated_at"] = timestamp
+    state.setdefault("history", []).append({"at": timestamp, "event": "task_retry_authorized", "version": version, "proposal_lock_id": lock["lock_id"]})
+    atomic_json_write(state_path, state)
+    return state
+
+
 def approve_gate(
     run_dir: Path,
     gate: str,
@@ -798,12 +1212,14 @@ def approve_gate(
     candidate_id: str | None = None,
 ) -> dict[str, Any]:
     state_path, state = load_state(run_dir)
+    if schema_version(state) == 3:
+        raise WorkflowError("schema v3 使用 finalize-proposal 和 lock-proposal，不使用旧 Gate 审批")
     expected_stage = {"script": "script_review", "keyframe": "keyframe_review", "task": "task_review"}[gate]
     if state.get("stage") != expected_stage:
         raise WorkflowError(f"{gate} 确认只能在 {expected_stage} 阶段执行")
     timestamp = now_iso()
     approvals = state.setdefault("approvals", {})
-    is_v2 = schema_version(state) >= 2
+    is_v2 = schema_version(state) == 2
 
     if gate == "script":
         script = artifact_entry(state, "script", version)
@@ -878,7 +1294,20 @@ def approve_gate(
 
 def check_transition_preconditions(state: dict[str, Any], current: str, new_stage: str) -> None:
     approvals = state.get("approvals", {})
-    if current == "keyframe_review" and new_stage == "task_review":
+    if schema_version(state) == 3 and current == "production_ready" and new_stage == "submitted":
+        lock = approvals.get("proposal")
+        if not lock or lock.get("audit", {}).get("create_task_authorized") is not True:
+            raise WorkflowError("提交前必须存在授权创建任务的提案锁")
+        binding = require_bound_request(state)
+        task_result = artifact_entry(state, "task-result")
+        verify_artifact_integrity(task_result, "task-result")
+        if task_result.get("proposal_lock_id") != lock.get("lock_id"):
+            raise WorkflowError("最新任务结果不属于当前提案锁")
+        if task_result.get("request_version") != binding["request"]["version"]:
+            raise WorkflowError("最新任务结果未绑定当前已校验请求")
+        if not state.get("task", {}).get("task_id"):
+            raise WorkflowError("进入 submitted 前必须记录当前任务的 task_id")
+    elif current == "keyframe_review" and new_stage == "task_review":
         if "keyframe" not in approvals:
             raise WorkflowError("进入任务确认前必须确认关键帧")
         h3_prompt = artifact_entry(state, "h3-prompt")
@@ -928,7 +1357,7 @@ def set_stage(run_dir: Path, expected: str, new_stage: str) -> dict[str, Any]:
     elif new_stage == "keyframe_review" and current == "task_review":
         approvals.pop("keyframe", None)
         approvals.pop("task", None)
-    elif current == "failed" and new_stage == "task_review":
+    elif current == "failed" and new_stage in {"task_review", "proposal_locked"}:
         approvals.pop("task", None)
         state.pop("task", None)
     state["stage"] = new_stage
@@ -980,8 +1409,70 @@ def load_console_validator() -> Any:
     return module
 
 
+def validate_v3_request_for_run(state: dict[str, Any], path: Path) -> dict[str, Any]:
+    if state.get("stage") != "production_ready":
+        raise WorkflowError("schema v3 最终请求只能在 production_ready 阶段校验")
+    lock = state.get("approvals", {}).get("proposal")
+    if not lock or lock.get("audit", {}).get("create_task_authorized") is not True:
+        raise WorkflowError("缺少创建一次视频任务的客户授权")
+    request_entry = artifact_entry(state, "request")
+    errors: list[str] = []
+    if Path(path).resolve() != Path(request_entry["path"]).resolve():
+        errors.append("必须校验最新记录的 request 产物")
+    try:
+        request = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"valid": False, "request_sha256": None, "errors": [f"request 必须是有效 JSON: {exc}"]}
+    production = artifact_entry(state, "production-package")
+    production_payload = read_json_artifact(production, "production-package")
+    proposal = proposal_entry(state, lock["proposal_revision"])
+    verify_proposal_components(proposal)
+    preview_entry = artifact_entry(state, "task-preview", production_payload["task_preview"]["version"])
+    preview = read_json_artifact(preview_entry, "task-preview")
+    h3_prompt = artifact_entry(state, "h3-prompt", production_payload["h3_prompt"]["version"])
+    try:
+        errors.extend(load_console_validator().validate(request))
+    except (AttributeError, OSError) as exc:
+        raise WorkflowError(f"Console 请求校验器执行失败: {exc}") from exc
+    for field in ("workspace_id", "mode", "duration_seconds", "aspect_ratio", "quality", "execution_backend", "idempotency_key"):
+        if request.get(field) != preview.get(field):
+            errors.append(f"request.{field} 与 production package 不一致")
+    approved_prompt = verify_artifact_integrity(h3_prompt, "h3-prompt").read_text(encoding="utf-8-sig").strip()
+    if not isinstance(request.get("prompt"), str) or request["prompt"].strip() != approved_prompt:
+        errors.append("request.prompt 与 production package 中的 H3 prompt 不一致")
+    assets = request.get("assets")
+    if not isinstance(assets, list) or len(assets) != 1 or not isinstance(assets[0], dict) or assets[0].get("role") != "first_frame":
+        errors.append("I2V 请求必须只包含一个 first_frame 素材")
+    else:
+        try:
+            upload = artifact_entry(state, "asset-upload")
+            upload_payload = read_json_artifact(upload, "asset-upload")
+            if upload_payload.get("proposal_lock_id") != lock["lock_id"]:
+                errors.append("asset-upload 未绑定当前提案锁")
+            if upload_payload.get("source_sha256") != production_payload["aggregate_keyframe"]["sha256"]:
+                errors.append("asset-upload 未绑定锁定总聚合关键帧")
+            if assets[0].get("asset_id") != upload_payload.get("asset_id"):
+                errors.append("request first_frame asset_id 与已记录上传结果不一致")
+        except WorkflowError as exc:
+            errors.append(str(exc))
+    return {
+        "valid": not errors,
+        "request_sha256": sha256_file(path),
+        "request_version": request_entry["version"],
+        "proposal_lock_id": lock["lock_id"],
+        "proposal_revision": lock["proposal_revision"],
+        "proposal_package_sha256": lock["proposal_package_sha256"],
+        "production_package_version": production["version"],
+        "candidate_id": lock["candidate_id"],
+        "idempotency_key": request.get("idempotency_key"),
+        "errors": errors,
+    }
+
+
 def validate_request_for_run(run_dir: Path, path: Path) -> dict[str, Any]:
     _, state = load_state(run_dir)
+    if schema_version(state) == 3:
+        return validate_v3_request_for_run(state, path)
     approval = state.get("approvals", {}).get("task")
     errors: list[str] = []
     if state.get("stage") != "task_review" or not approval:
@@ -1053,12 +1544,15 @@ def record_request_validation(run_dir: Path, result: dict[str, Any]) -> dict[str
     if not result.get("valid"):
         raise WorkflowError("不能记录失败的最终请求校验")
     state_path, state = load_state(run_dir)
-    approval = state.get("approvals", {}).get("task", {})
+    approval = state.get("approvals", {}).get("proposal" if schema_version(state) == 3 else "task", {})
     request = artifact_entry(state, "request")
     verify_artifact_integrity(request, "request")
     if result.get("request_sha256") != request.get("sha256"):
         raise WorkflowError("校验结果与最新 request 不匹配")
-    if result.get("intent_id") != approval.get("intent_id"):
+    if schema_version(state) == 3:
+        if result.get("proposal_lock_id") != approval.get("lock_id"):
+            raise WorkflowError("校验结果不属于当前提案锁")
+    elif result.get("intent_id") != approval.get("intent_id"):
         raise WorkflowError("校验结果不属于当前 Gate 3 审批意图")
     entries = state.setdefault("artifacts", {}).setdefault("request-validation", [])
     version = len(entries) + 1
@@ -1083,6 +1577,27 @@ def record_request_validation(run_dir: Path, result: dict[str, Any]) -> dict[str
 
 
 def require_bound_request(state: dict[str, Any]) -> dict[str, Any]:
+    if schema_version(state) == 3:
+        approval = state.get("approvals", {}).get("proposal")
+        if not approval:
+            raise WorkflowError("缺少当前提案锁")
+        request = artifact_entry(state, "request")
+        verify_artifact_integrity(request, "request")
+        validation = artifact_entry(state, "request-validation")
+        payload = read_json_artifact(validation, "request-validation")
+        production = artifact_entry(state, "production-package")
+        if not payload.get("valid") or payload.get("request_sha256") != request.get("sha256"):
+            raise WorkflowError("最新 request 没有匹配的成功校验记录")
+        expected = {
+            "proposal_lock_id": approval["lock_id"],
+            "proposal_revision": approval["proposal_revision"],
+            "proposal_package_sha256": approval["proposal_package_sha256"],
+            "production_package_version": production["version"],
+        }
+        for field, value in expected.items():
+            if payload.get(field) != value:
+                raise WorkflowError(f"request 校验记录的 {field} 与生产包不一致")
+        return {"request": request, "validation": validation, "payload": payload}
     approval = state.get("approvals", {}).get("task")
     if not approval:
         raise WorkflowError("缺少当前 Gate 3 审批")
@@ -1117,10 +1632,92 @@ def record_artifact(
     if not source.is_file():
         raise WorkflowError(f"产物源文件不存在: {source}")
     state_path, state = load_state(run_dir)
-    is_v2 = schema_version(state) >= 2
+    schema = schema_version(state)
+    is_v2 = schema == 2
+    is_v3 = schema == 3
     selected_id: str | None = None
     binding: dict[str, Any] = {}
-    if is_v2 and kind == "script":
+    if is_v3:
+        allowed_direct = {
+            "script",
+            "dimension-reference",
+            "dimension-reference-image",
+            "aggregate-keyframe-prompt",
+            "aggregate-keyframe",
+            "h3-prompt",
+            "task-preview",
+            "request",
+            "asset-upload",
+            "task-result",
+        }
+        if kind not in allowed_direct:
+            raise WorkflowError(f"schema v3 的 {kind} 必须由专用命令生成")
+        if candidate_id is not None:
+            raise WorkflowError("schema v3 产物不接受 candidate-id；候选由提案锁绑定")
+        stage = state.get("stage")
+        if kind == "script":
+            if stage != "proposal_review":
+                raise WorkflowError("script 只能在 proposal_review 阶段记录")
+            validate_script_set(source)
+        elif kind == "dimension-reference":
+            if stage != "proposal_review":
+                raise WorkflowError("dimension-reference 只能在 proposal_review 阶段记录")
+            validate_dimension_reference(source)
+        elif kind in {"dimension-reference-image", "aggregate-keyframe-prompt", "aggregate-keyframe"}:
+            if stage != "proposal_review":
+                raise WorkflowError(f"{kind} 只能在 proposal_review 阶段记录")
+            if kind.endswith("image") or kind == "aggregate-keyframe":
+                if source.suffix.casefold() not in SUPPORTED_IMAGES:
+                    raise WorkflowError(f"{kind} 必须是支持的图片格式")
+            if kind == "dimension-reference-image":
+                dimension = artifact_entry(state, "dimension-reference")
+                binding["dimension_version"] = dimension["version"]
+        elif kind in {"h3-prompt", "task-preview"}:
+            lock = state.get("approvals", {}).get("proposal")
+            if stage != "proposal_locked" or not lock:
+                raise WorkflowError(f"{kind} 只能在提案锁定后记录")
+            binding = {
+                "proposal_lock_id": lock["lock_id"],
+                "proposal_revision": lock["proposal_revision"],
+                "proposal_package_sha256": lock["proposal_package_sha256"],
+                "candidate_id": lock["candidate_id"],
+            }
+            if kind == "task-preview":
+                payload = json.loads(source.read_text(encoding="utf-8"))
+                for field, expected in binding.items():
+                    if payload.get(field) != expected:
+                        raise WorkflowError(f"task-preview.{field} 未绑定锁定提案")
+                h3 = artifact_entry(state, "h3-prompt")
+                if payload.get("h3_prompt_version") != h3["version"]:
+                    raise WorkflowError("task-preview.h3_prompt_version 未绑定最新 H3 prompt")
+                binding["h3_prompt_version"] = h3["version"]
+                if state.get("active_retry"):
+                    binding["retry_authorization_version"] = state["active_retry"]["authorization_version"]
+        elif kind == "request":
+            if stage != "production_ready":
+                raise WorkflowError("request 只能在 production_ready 阶段记录")
+        elif kind == "asset-upload":
+            if stage != "production_ready":
+                raise WorkflowError("asset-upload 只能在 production_ready 阶段记录")
+            try:
+                upload = json.loads(source.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise WorkflowError(f"asset-upload 必须是有效 JSON: {exc}") from exc
+            production = read_json_artifact(artifact_entry(state, "production-package"), "production-package")
+            expected = {
+                "proposal_lock_id": production["proposal_lock_id"],
+                "source_sha256": production["aggregate_keyframe"]["sha256"],
+            }
+            for field, value in expected.items():
+                if upload.get(field) != value:
+                    raise WorkflowError(f"asset-upload.{field} 未绑定锁定总聚合关键帧")
+            if not is_uuid(upload.get("asset_id")):
+                raise WorkflowError("asset-upload.asset_id 必须是 UUID")
+            binding.update(expected)
+            binding["asset_id"] = upload["asset_id"]
+        elif kind == "task-result" and stage not in {"production_ready", "submitted", "monitoring"}:
+            raise WorkflowError("task-result 只能在已授权的生产或监控阶段记录")
+    elif is_v2 and kind == "script":
         if state.get("stage") != "script_review":
             raise WorkflowError("v2 script 只能在 script_review 阶段记录")
         validate_script_set(source)
@@ -1151,7 +1748,10 @@ def record_artifact(
         raise WorkflowError("schema v1 产物不接受 candidate-id")
     request_binding: dict[str, Any] | None = None
     if kind == "task-result":
-        if "task" not in state.get("approvals", {}):
+        if is_v3:
+            if "proposal" not in state.get("approvals", {}):
+                raise WorkflowError("记录任务结果前必须锁定并授权提案")
+        elif "task" not in state.get("approvals", {}):
             raise WorkflowError("记录任务结果前必须完成 Gate 3 确认")
         request_binding = require_bound_request(state)
     entries = state.setdefault("artifacts", {}).setdefault(kind, [])
@@ -1184,7 +1784,10 @@ def record_artifact(
         entry["candidate_id"] = selected_id
     entry.update(binding)
     if kind == "task-result" and request_binding is not None:
-        entry["intent_id"] = request_binding["payload"]["intent_id"]
+        if is_v3:
+            entry["proposal_lock_id"] = request_binding["payload"]["proposal_lock_id"]
+        else:
+            entry["intent_id"] = request_binding["payload"]["intent_id"]
         entry["request_version"] = request_binding["request"]["version"]
     entries.append(entry)
     if kind == "task-result" and isinstance(sanitized_payload, dict):
@@ -1203,7 +1806,10 @@ def record_artifact(
         state["task"] = {
             key: sanitized_payload[key] for key in allowed_task_keys if key in sanitized_payload
         }
-        state["task"]["intent_id"] = request_binding["payload"]["intent_id"]
+        if is_v3:
+            state["task"]["proposal_lock_id"] = request_binding["payload"]["proposal_lock_id"]
+        else:
+            state["task"]["intent_id"] = request_binding["payload"]["intent_id"]
         state["task"]["request_version"] = request_binding["request"]["version"]
     state["updated_at"] = timestamp
     state.setdefault("history", []).append(
@@ -1378,6 +1984,37 @@ def build_parser() -> argparse.ArgumentParser:
     request_parser = subparsers.add_parser("validate-request", help="Validate and bind the final Console request")
     request_parser.add_argument("request", type=Path)
     request_parser.add_argument("--run-dir", required=True, type=Path)
+
+    feedback_parser = subparsers.add_parser("record-feedback", help="Append client feedback for a proposal revision")
+    feedback_parser.add_argument("run_dir", type=Path)
+    feedback_parser.add_argument("--proposal-version", required=True, type=int)
+    feedback_parser.add_argument("--source", required=True, type=Path)
+
+    proposal_parser = subparsers.add_parser("finalize-proposal", help="Publish an immutable proposal package")
+    proposal_parser.add_argument("run_dir", type=Path)
+    proposal_parser.add_argument("--script-version", required=True, type=int)
+    proposal_parser.add_argument("--dimension-version", required=True, type=int)
+    proposal_parser.add_argument("--dimension-image-version", required=True, type=int)
+    proposal_parser.add_argument("--keyframe-version", required=True, type=int)
+    proposal_parser.add_argument("--base-revision", type=int)
+
+    lock_parser = subparsers.add_parser("lock-proposal", help="Lock one proposal and selected script candidate")
+    lock_parser.add_argument("run_dir", type=Path)
+    lock_parser.add_argument("--proposal-version", required=True, type=int)
+    lock_parser.add_argument("--candidate-id", required=True, choices=CANDIDATE_IDS)
+    lock_parser.add_argument("--approval-json", required=True, type=Path)
+
+    production_parser = subparsers.add_parser("finalize-production", help="Bind the locked proposal into an H3 production package")
+    production_parser.add_argument("run_dir", type=Path)
+
+    revision_parser = subparsers.add_parser("begin-revision", help="Start a proposal revision from client feedback")
+    revision_parser.add_argument("run_dir", type=Path)
+    revision_parser.add_argument("--base-revision", required=True, type=int)
+    revision_parser.add_argument("--feedback-version", required=True, type=int)
+
+    retry_parser = subparsers.add_parser("authorize-retry", help="Record explicit client authorization for one failed-task retry")
+    retry_parser.add_argument("run_dir", type=Path)
+    retry_parser.add_argument("--approval-json", required=True, type=Path)
     return parser
 
 
@@ -1413,6 +2050,18 @@ def main() -> int:
                 print(json.dumps({"ok": False, "result": result}, ensure_ascii=False, indent=2))
                 return 1
             result["recorded_artifact"] = record_request_validation(args.run_dir, result)
+        elif args.command == "record-feedback":
+            result = record_feedback(args.run_dir, args.proposal_version, args.source)
+        elif args.command == "finalize-proposal":
+            result = finalize_proposal(args.run_dir, args.script_version, args.dimension_version, args.dimension_image_version, args.keyframe_version, args.base_revision)
+        elif args.command == "lock-proposal":
+            result = lock_proposal(args.run_dir, args.proposal_version, args.candidate_id, args.approval_json)
+        elif args.command == "finalize-production":
+            result = finalize_production(args.run_dir)
+        elif args.command == "begin-revision":
+            result = begin_revision(args.run_dir, args.base_revision, args.feedback_version)
+        elif args.command == "authorize-retry":
+            result = authorize_retry(args.run_dir, args.approval_json)
         else:
             raise WorkflowError(f"未知命令: {args.command}")
     except (OSError, WorkflowError) as exc:
