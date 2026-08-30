@@ -1,0 +1,11 @@
+interface:
+  display_name: "Generate Client Ad Video"
+  short_description: "Create client ads from chat uploads or local project files"
+  default_prompt: "Use $generate-client-ad-video with my product description and uploaded images, saving them locally before creating the ad."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "minimax_h3_console"
+      description: "Upload the approved keyframe and submit or monitor MiniMax H3 video tasks"
+policy:
+  allow_implicit_invocation: true

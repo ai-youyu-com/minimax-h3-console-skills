@@ -15,6 +15,8 @@ MiniMax H3 的提示词规范和创作类 Skills 来源于 [MiniMax-AI/MiniMax-H
 - 查询任务进度和最终视频链接；
 - 重试失败任务或取消可取消的任务。
 
+仓库还提供 `generate-client-ad-video`：用户既可以在项目目录中放置 `ad-brief.md` 和同级图片，也可以直接在对话中描述产品并上传图片。Skill 会把聊天信息和附件保存成标准本地项目，再通过三次固定选项确认完成广告脚本、聚合关键帧和 H3 视频任务。
+
 生成视频时，建议先由官方 `h3-prompt-writing` Skill 按照 H3 规范组织时间轴、镜头、对白、环境声音和音乐，再由 Console Skill 将提示词与素材转换成 MCP 接受的任务格式。
 
 在 R2V 模式中，所有图片都使用 `reference_image` 角色；每张图片拥有唯一的 `mention_name`，提示词通过 `@mention_name` 引用对应素材。
@@ -73,6 +75,26 @@ npx skills add MiniMax-AI/MiniMax-H3 --skill '*' --agent codex
 npx skills add MiniMax-AI/MiniMax-H3 --skill h3-prompt-writing
 ```
 
+若要安装文件驱动的客户广告工作流：
+
+```bash
+npx skills add ai-youyu-com/minimax-h3-console-skills --skill generate-client-ad-video
+```
+
+在任意项目子目录中放置以下文件后，调用 `$generate-client-ad-video`：
+
+```text
+client-project/
+├── ad-brief.md
+├── product.jpg
+├── spokesperson.png
+└── scene.webp
+```
+
+`ad-brief.md` 的字段模板位于该 Skill 的 `references/brief-template.md`。图片必须与描述文件同级；运行产物自动保存到项目的 `output/<run-id>/`。
+
+也可以直接调用 `$generate-client-ad-video`，在同一条消息中描述产品、卖点和广告用途并上传图片。Skill 会自动创建不覆盖旧数据的项目子目录，将产品信息写入 `ad-brief.md`，将上传图片复制到同级目录，然后继续相同的确认流程。
+
 可以通过以下命令查看官方仓库当前提供的完整列表，具体说明请参阅 [MiniMax H3 官方 Skills](https://github.com/MiniMax-AI/MiniMax-H3/tree/main/skills)：
 
 ```bash
@@ -109,6 +131,11 @@ Skill 只提供 Agent 工作流，视频提交能力由 `minimax_h3_console` MCP
 
 ```text
 skills/
+├── generate-client-ad-video/
+│   ├── SKILL.md
+│   ├── agents/
+│   ├── references/
+│   └── scripts/
 └── minimax-h3-console-video-generator/
     ├── SKILL.md
     ├── agents/
