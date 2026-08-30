@@ -1,7 +1,7 @@
 interface:
   display_name: "Generate Client Ad Video"
-  short_description: "Create client ads from chat uploads or local project files"
-  default_prompt: "Use $generate-client-ad-video with my product description and uploaded images, saving them locally before creating the ad."
+  short_description: "Orchestrate child agents for five scripts, keyframes, and one video"
+  default_prompt: "Use $generate-client-ad-video to delegate five script options and matching keyframes to child agents, then let me choose one video to submit. Keep this conversation orchestration-only."
 dependencies:
   tools:
     - type: "mcp"

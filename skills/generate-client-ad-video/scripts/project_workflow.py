@@ -21,6 +21,17 @@ from typing import Any
 BRIEF_NAME = "ad-brief.md"
 SUPPORTED_IMAGES = {".png", ".jpg", ".jpeg", ".webp"}
 REPLACEMENT_STEM = "approved-keyframe"
+CURRENT_SCHEMA_VERSION = 2
+CANDIDATE_IDS = tuple(str(index) for index in range(1, 6))
+SCRIPT_CANDIDATE_FIELDS = {
+    "candidate_id",
+    "creative_direction",
+    "hook",
+    "storyboard",
+    "voiceover",
+    "source_mapping",
+    "post_production_text",
+}
 TERMINAL_STAGES = {"succeeded", "cancelled"}
 ALLOWED_STAGES = {
     "script_review",
@@ -501,7 +512,7 @@ def inspect_project(project: Path) -> dict[str, Any]:
         assets.append(metadata)
 
     return {
-        "schema_version": 1,
+        "schema_version": CURRENT_SCHEMA_VERSION,
         "valid": not errors,
         "errors": errors,
         "project_dir": str(project_dir),
@@ -572,7 +583,7 @@ def start_run(project: Path, run_id: str | None = None) -> dict[str, Any]:
     state_path = run_dir / "state.json"
     atomic_json_write(manifest_path, inspection)
     state = {
-        "schema_version": 1,
+        "schema_version": CURRENT_SCHEMA_VERSION,
         "run_id": run_id,
         "project_dir": inspection["project_dir"],
         "stage": "script_review",
@@ -605,6 +616,88 @@ def artifact_entry(state: dict[str, Any], kind: str, version: int | None = None)
         if entry.get("version") == version:
             return entry
     raise WorkflowError(f"找不到产物版本: {kind} v{version}")
+
+
+def schema_version(state: dict[str, Any]) -> int:
+    value = state.get("schema_version", 1)
+    return value if isinstance(value, int) else 1
+
+
+def validate_candidate_id(candidate_id: str | None) -> str:
+    value = str(candidate_id or "").strip()
+    if value not in CANDIDATE_IDS:
+        raise WorkflowError("candidate-id 必须是 1、2、3、4 或 5")
+    return value
+
+
+def validate_script_set(path: Path) -> tuple[str, ...]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise WorkflowError(f"v2 script 必须是有效 JSON: {exc}") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("candidates"), list):
+        raise WorkflowError("v2 script 根节点必须包含 candidates 数组")
+    candidates = payload["candidates"]
+    if len(candidates) != len(CANDIDATE_IDS):
+        raise WorkflowError("v2 script 必须恰好包含 5 个候选")
+    ids: list[str] = []
+    for item in candidates:
+        if not isinstance(item, dict):
+            raise WorkflowError("script candidates 的每一项都必须是对象")
+        missing = sorted(
+            field
+            for field in SCRIPT_CANDIDATE_FIELDS
+            if field not in item or item[field] in (None, "", [])
+        )
+        if missing:
+            raise WorkflowError("script candidate 缺少字段: " + ", ".join(missing))
+        candidate_id = validate_candidate_id(str(item.get("candidate_id")))
+        if not isinstance(item.get("storyboard"), list):
+            raise WorkflowError(f"候选 {candidate_id} 的 storyboard 必须是非空数组")
+        ids.append(candidate_id)
+    if tuple(ids) != CANDIDATE_IDS:
+        raise WorkflowError("script candidates 必须按 1、2、3、4、5 排列且不得重复")
+    return tuple(ids)
+
+
+def artifact_entry_for_candidate(
+    state: dict[str, Any], kind: str, candidate_id: str, version: int | None = None
+) -> dict[str, Any]:
+    candidate_id = validate_candidate_id(candidate_id)
+    entries = state.get("artifacts", {}).get(kind, [])
+    script_version = state.get("approvals", {}).get("script", {}).get("script_version")
+    matches = [
+        entry
+        for entry in entries
+        if entry.get("candidate_id") == candidate_id
+        and entry.get("script_version") == script_version
+    ]
+    if version is None:
+        if matches:
+            return matches[-1]
+    else:
+        for entry in matches:
+            if entry.get("version") == version:
+                return entry
+    suffix = f" v{version}" if version is not None else ""
+    raise WorkflowError(f"找不到候选 {candidate_id} 的 {kind}{suffix}")
+
+
+def require_complete_candidate_batch(state: dict[str, Any]) -> dict[str, dict[str, dict[str, Any]]]:
+    coverage: dict[str, dict[str, dict[str, Any]]] = {}
+    missing: list[str] = []
+    for candidate_id in CANDIDATE_IDS:
+        try:
+            prompt = artifact_entry_for_candidate(state, "keyframe-prompt", candidate_id)
+            keyframe = artifact_entry_for_candidate(state, "keyframe", candidate_id)
+            if keyframe.get("keyframe_prompt_version") != prompt.get("version"):
+                raise WorkflowError("图片不是由当前候选的最新提示词生成")
+            coverage[candidate_id] = {"prompt": prompt, "keyframe": keyframe}
+        except WorkflowError:
+            missing.append(candidate_id)
+    if missing:
+        raise WorkflowError("关键帧批次尚未完成，缺少或需重生成候选: " + ", ".join(missing))
+    return coverage
 
 
 def verify_artifact_integrity(entry: dict[str, Any], label: str) -> Path:
@@ -655,6 +748,18 @@ def validate_task_preview(
         "h3_prompt_version": h3_prompt.get("version"),
         "keyframe_version": keyframe_version,
     }
+    if schema_version(state) >= 2:
+        approval = state.get("approvals", {}).get("keyframe", {})
+        expected.update(
+            {
+                "candidate_id": approval.get("candidate_id"),
+                "script_version": approval.get("script_version"),
+                "keyframe_prompt_version": approval.get("keyframe_prompt_version"),
+            }
+        )
+        for field in ("candidate_id", "script_version", "keyframe_prompt_version", "keyframe_version"):
+            if h3_prompt.get(field) != expected.get(field):
+                errors.append(f"h3-prompt.{field} 未绑定当前已选候选")
     for field, value in expected.items():
         if payload.get(field) != value:
             errors.append(f"task-preview.{field} 必须等于 {value!r}")
@@ -686,28 +791,57 @@ def validate_task_preview(
     return payload
 
 
-def approve_gate(run_dir: Path, gate: str, version: int | None = None) -> dict[str, Any]:
+def approve_gate(
+    run_dir: Path,
+    gate: str,
+    version: int | None = None,
+    candidate_id: str | None = None,
+) -> dict[str, Any]:
     state_path, state = load_state(run_dir)
     expected_stage = {"script": "script_review", "keyframe": "keyframe_review", "task": "task_review"}[gate]
     if state.get("stage") != expected_stage:
         raise WorkflowError(f"{gate} 确认只能在 {expected_stage} 阶段执行")
     timestamp = now_iso()
     approvals = state.setdefault("approvals", {})
+    is_v2 = schema_version(state) >= 2
 
     if gate == "script":
         script = artifact_entry(state, "script", version)
-        keyframe_prompt = artifact_entry(state, "keyframe-prompt")
-        approvals["script"] = {
-            "at": timestamp,
-            "script_version": script["version"],
-            "keyframe_prompt_version": keyframe_prompt["version"],
-        }
+        if is_v2:
+            candidate_ids = validate_script_set(verify_artifact_integrity(script, "script"))
+            approvals["script"] = {
+                "at": timestamp,
+                "script_version": script["version"],
+                "candidate_ids": list(candidate_ids),
+            }
+        else:
+            keyframe_prompt = artifact_entry(state, "keyframe-prompt")
+            approvals["script"] = {
+                "at": timestamp,
+                "script_version": script["version"],
+                "keyframe_prompt_version": keyframe_prompt["version"],
+            }
         state["stage"] = "keyframe_review"
     elif gate == "keyframe":
         if "script" not in approvals:
             raise WorkflowError("确认关键帧前必须先确认脚本")
-        keyframe = artifact_entry(state, "keyframe", version)
-        approvals["keyframe"] = {"at": timestamp, "keyframe_version": keyframe["version"]}
+        if is_v2:
+            selected_id = validate_candidate_id(candidate_id)
+            batch = require_complete_candidate_batch(state)
+            keyframe = artifact_entry_for_candidate(state, "keyframe", selected_id, version)
+            prompt = batch[selected_id]["prompt"]
+            if keyframe.get("keyframe_prompt_version") != prompt.get("version"):
+                raise WorkflowError("所选关键帧未绑定当前候选的最新提示词")
+            approvals["keyframe"] = {
+                "at": timestamp,
+                "candidate_id": selected_id,
+                "script_version": approvals["script"]["script_version"],
+                "keyframe_prompt_version": prompt["version"],
+                "keyframe_version": keyframe["version"],
+            }
+        else:
+            keyframe = artifact_entry(state, "keyframe", version)
+            approvals["keyframe"] = {"at": timestamp, "keyframe_version": keyframe["version"]}
         approvals.pop("task", None)
     else:
         if "script" not in approvals or "keyframe" not in approvals:
@@ -715,12 +849,23 @@ def approve_gate(run_dir: Path, gate: str, version: int | None = None) -> dict[s
         h3_prompt = artifact_entry(state, "h3-prompt")
         task_preview = artifact_entry(state, "task-preview")
         validate_task_preview(state, task_preview, h3_prompt)
-        approvals["task"] = {
-            "at": timestamp,
-            "intent_id": str(uuid.uuid4()),
+        task_binding = {
             "h3_prompt_version": h3_prompt["version"],
             "task_preview_version": task_preview["version"],
             "keyframe_version": approvals["keyframe"]["keyframe_version"],
+        }
+        if is_v2:
+            for field in ("candidate_id", "script_version", "keyframe_prompt_version"):
+                task_binding[field] = approvals["keyframe"][field]
+        existing_task = approvals.get("task")
+        if existing_task is not None:
+            if all(existing_task.get(field) == value for field, value in task_binding.items()):
+                return state
+            raise WorkflowError("当前运行已有不同绑定的 Gate 3 审批；请先返回修改或进入显式重试流程")
+        approvals["task"] = {
+            "at": timestamp,
+            "intent_id": str(uuid.uuid4()),
+            **task_binding,
         }
 
     state["updated_at"] = timestamp
@@ -892,6 +1037,15 @@ def validate_request_for_run(run_dir: Path, path: Path) -> dict[str, Any]:
         "intent_id": approval["intent_id"],
         "idempotency_key": request.get("idempotency_key"),
         "errors": errors,
+        **(
+            {
+                "candidate_id": approval.get("candidate_id"),
+                "script_version": approval.get("script_version"),
+                "keyframe_prompt_version": approval.get("keyframe_prompt_version"),
+            }
+            if schema_version(state) >= 2
+            else {}
+        ),
     }
 
 
@@ -942,19 +1096,59 @@ def require_bound_request(state: dict[str, Any]) -> dict[str, Any]:
         raise WorkflowError("request 校验记录版本不匹配")
     if payload.get("intent_id") != approval.get("intent_id"):
         raise WorkflowError("request 校验记录不属于当前 Gate 3 审批意图")
-    for field in ("task_preview_version", "h3_prompt_version", "keyframe_version"):
+    binding_fields = ["task_preview_version", "h3_prompt_version", "keyframe_version"]
+    if schema_version(state) >= 2:
+        binding_fields.extend(["candidate_id", "script_version", "keyframe_prompt_version"])
+    for field in binding_fields:
         if payload.get(field) != approval.get(field):
             raise WorkflowError(f"request 校验记录的 {field} 与审批不一致")
     return {"request": request, "validation": validation, "payload": payload}
 
 
-def record_artifact(run_dir: Path, kind: str, source: Path) -> dict[str, Any]:
+def record_artifact(
+    run_dir: Path,
+    kind: str,
+    source: Path,
+    candidate_id: str | None = None,
+) -> dict[str, Any]:
     if kind not in ARTIFACT_KINDS:
         raise WorkflowError(f"未知产物类型: {kind}")
     source = source.resolve()
     if not source.is_file():
         raise WorkflowError(f"产物源文件不存在: {source}")
     state_path, state = load_state(run_dir)
+    is_v2 = schema_version(state) >= 2
+    selected_id: str | None = None
+    binding: dict[str, Any] = {}
+    if is_v2 and kind == "script":
+        if state.get("stage") != "script_review":
+            raise WorkflowError("v2 script 只能在 script_review 阶段记录")
+        validate_script_set(source)
+        if candidate_id is not None:
+            raise WorkflowError("script 集合不接受 candidate-id")
+    elif is_v2 and kind in {"keyframe-prompt", "keyframe"}:
+        if state.get("stage") != "keyframe_review" or "script" not in state.get("approvals", {}):
+            raise WorkflowError(f"{kind} 只能在确认 5 个脚本后记录")
+        selected_id = validate_candidate_id(candidate_id)
+        binding["script_version"] = state["approvals"]["script"]["script_version"]
+        if kind == "keyframe":
+            prompt = artifact_entry_for_candidate(state, "keyframe-prompt", selected_id)
+            binding["keyframe_prompt_version"] = prompt["version"]
+    elif is_v2 and kind == "h3-prompt":
+        approval = state.get("approvals", {}).get("keyframe")
+        if state.get("stage") != "keyframe_review" or not approval:
+            raise WorkflowError("h3-prompt 只能在选择一组脚本和关键帧后记录")
+        selected_id = validate_candidate_id(candidate_id)
+        if selected_id != approval.get("candidate_id"):
+            raise WorkflowError("h3-prompt.candidate-id 必须等于已选候选")
+        binding = {
+            field: approval[field]
+            for field in ("script_version", "keyframe_prompt_version", "keyframe_version")
+        }
+    elif candidate_id is not None:
+        if is_v2:
+            raise WorkflowError(f"{kind} 不接受 candidate-id")
+        raise WorkflowError("schema v1 产物不接受 candidate-id")
     request_binding: dict[str, Any] | None = None
     if kind == "task-result":
         if "task" not in state.get("approvals", {}):
@@ -963,7 +1157,8 @@ def record_artifact(run_dir: Path, kind: str, source: Path) -> dict[str, Any]:
     entries = state.setdefault("artifacts", {}).setdefault(kind, [])
     version = len(entries) + 1
     suffix = source.suffix.casefold() or ".bin"
-    destination = run_dir.resolve() / f"{kind}-v{version:02d}{suffix}"
+    candidate_part = f"-{selected_id}" if selected_id is not None else ""
+    destination = run_dir.resolve() / f"{kind}{candidate_part}-v{version:02d}{suffix}"
     if destination.exists():
         raise WorkflowError(f"产物目标已存在: {destination}")
 
@@ -985,6 +1180,9 @@ def record_artifact(run_dir: Path, kind: str, source: Path) -> dict[str, Any]:
         "sha256": sha256_file(destination),
         "recorded_at": timestamp,
     }
+    if selected_id is not None:
+        entry["candidate_id"] = selected_id
+    entry.update(binding)
     if kind == "task-result" and request_binding is not None:
         entry["intent_id"] = request_binding["payload"]["intent_id"]
         entry["request_version"] = request_binding["request"]["version"]
@@ -1009,7 +1207,13 @@ def record_artifact(run_dir: Path, kind: str, source: Path) -> dict[str, Any]:
         state["task"]["request_version"] = request_binding["request"]["version"]
     state["updated_at"] = timestamp
     state.setdefault("history", []).append(
-        {"at": timestamp, "event": "artifact_recorded", "kind": kind, "version": version}
+        {
+            "at": timestamp,
+            "event": "artifact_recorded",
+            "kind": kind,
+            "version": version,
+            **({"candidate_id": selected_id} if selected_id is not None else {}),
+        }
     )
     atomic_json_write(state_path, state)
     return entry
@@ -1158,11 +1362,13 @@ def build_parser() -> argparse.ArgumentParser:
     approve_parser.add_argument("run_dir", type=Path)
     approve_parser.add_argument("--gate", required=True, choices=["script", "keyframe", "task"])
     approve_parser.add_argument("--version", type=int)
+    approve_parser.add_argument("--candidate-id", choices=CANDIDATE_IDS)
 
     record_parser = subparsers.add_parser("record", help="Copy an artifact into a versioned run")
     record_parser.add_argument("run_dir", type=Path)
     record_parser.add_argument("--kind", required=True, choices=sorted(ARTIFACT_KINDS))
     record_parser.add_argument("--source", required=True, type=Path)
+    record_parser.add_argument("--candidate-id", choices=CANDIDATE_IDS)
 
     prompt_parser = subparsers.add_parser("validate-h3-prompt", help="Validate the final I2VA prompt structure")
     prompt_parser.add_argument("prompt", type=Path)
@@ -1191,9 +1397,9 @@ def main() -> int:
         elif args.command == "set-stage":
             result = set_stage(args.run_dir, args.expect, args.stage)
         elif args.command == "approve":
-            result = approve_gate(args.run_dir, args.gate, args.version)
+            result = approve_gate(args.run_dir, args.gate, args.version, args.candidate_id)
         elif args.command == "record":
-            result = record_artifact(args.run_dir, args.kind, args.source)
+            result = record_artifact(args.run_dir, args.kind, args.source, args.candidate_id)
         elif args.command == "validate-h3-prompt":
             result = validate_h3_prompt(args.prompt, args.duration)
             if not result["valid"]:
