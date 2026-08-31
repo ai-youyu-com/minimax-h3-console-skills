@@ -15,6 +15,29 @@ The root conversation is orchestration-only. Give each child the absolute projec
 | H3 | Write and validate Ref2VA prompt plus R2V preview | Sanitized prompt/settings and lock binding |
 | Submission/monitor | Upload references, validate, create one task, and monitor it | Sanitized status/errors/final links |
 
+## Client-Facing Review Output
+
+After a production child finishes a review-stage deliverable, the root presents the detailed, sanitized tables returned by that child in its next client-facing reply. Artifact paths and concise recommendations are supplementary; they never replace the tables. Do not reduce complete child output to an overview, selected highlights, or a prose summary.
+
+If the required table is missing, truncated, or contains placeholders such as “see artifact,” the root must re-dispatch the responsible child to render it from the recorded artifact. The root does not reconstruct production content itself. Ask for selection, feedback, or confirmation only after the complete tables are visible in chat.
+
+### Script Review
+
+Present all five candidates, in candidate order. For each candidate, include:
+
+1. A metadata table covering candidate ID, plan name, creative idea, hook, and verified source mapping.
+2. A timeline table with one row per recorded timeline entry and exactly these content columns: `时间`, `画面`, `旁白`, `字幕`, `CTA`.
+
+Do not merge timeline rows, omit empty-looking but recorded fields, replace content with ellipses, or present only the recommended candidate. After all five detailed candidates, the root may add a short comparison/recommendation and then request an explicit choice or revision.
+
+### Storyboard Review
+
+Present tables for visual requirements, product-reference decision, asset roles, identity/scale evidence, and every chronological Storyboard panel. The panel table includes sequence/time, composition/action, referenced assets or roles, on-screen text, and continuity notes. Show the aggregate Storyboard preview in addition to these tables when available.
+
+### Production Preview and Result
+
+Before authorized submission, present sanitized tables for prompt/settings, every reference asset and `@mention_name` binding, validation status, and the exact non-secret task parameters. Monitoring and terminal-result replies present task identity, status, errors or output links, and relevant recorded versions in a table. Never expose secrets, tokens, upload headers, or presigned URLs.
+
 ## Schema v4 Artifacts
 
 All versions are append-only. Do not store secrets, tokens, presigned URLs, or upload headers.

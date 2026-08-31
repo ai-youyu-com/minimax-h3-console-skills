@@ -15,6 +15,8 @@ New runs use schema v4. Resume schema v1–v3 runs under their recorded legacy c
 
 The root conversation only dispatches and waits, presents sanitized child results, and records client feedback or confirmation. It must not inspect attachments, assemble deliverables, generate images/prompts, mutate run state, upload assets, submit, or monitor by itself.
 
+At every client review stage, the root must present the child's complete display-ready tables in the chat. A prose summary, recommendation, or artifact link may be added only after the tables; none of them may replace the detailed rows. If a child returns only a summary, the root must send it back to produce the missing tables from the recorded artifact before asking the client to choose or confirm.
+
 Delegate every production and state operation using [references/workflow-contract.md](references/workflow-contract.md). Children exchange recorded artifact paths and versions, never reconstructed chat prose. If delegation is unavailable, pause.
 
 ## Dependencies
@@ -30,6 +32,8 @@ Delegate every production and state operation using [references/workflow-contrac
 Delegate attachment inspection and verified fact extraction to an intake/state child. Use [references/chat-intake.md](references/chat-intake.md) for chat input and [references/brief-template.md](references/brief-template.md) for file input.
 
 The script child records `script-proposal` candidates 1–5. Client feedback is append-only and produces a new immutable script package. After selection or revision, record one `final-script` and call `lock-script`; the lock states `Script = LOCKED`. The state child then advances `script_locked → storyboard_review` before visual work begins.
+
+Before requesting a script selection, show all five candidates in full using the Script Review tables defined in the workflow contract, including every timeline row's time, visual, voiceover, subtitle, and CTA. Do not collapse them into a five-item overview or show only the recommended candidate.
 
 ## Storyboard Stage
 
