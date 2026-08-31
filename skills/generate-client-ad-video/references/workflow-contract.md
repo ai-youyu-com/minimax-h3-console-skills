@@ -2,99 +2,70 @@
 
 ## Delegation
 
-The root conversation is an orchestrator only. All filesystem, artifact, image, prompt, validation, submission, and monitoring work belongs to bounded child agents.
+The root conversation is orchestration-only. Give each child the absolute project/run paths, current stage, exact responsibility, required versions, and relevant Skill paths. Children record artifacts before returning display-ready results.
 
 | Child | Responsibility | Required return |
 |---|---|---|
-| Intake/state | inspect and ingest/discover; record feedback; begin revisions; perform state transitions | project/run paths, stage, validation summary |
-| Script | record one five-candidate script JSON | artifact version/path and display-ready script table |
-| Dimension | record dimension JSON and reference image | status, source disclosure, versions/paths, preview |
-| Aggregate keyframe | record one package-level prompt and one image | versions/paths and preview |
-| Proposal assembler | validate components and atomically publish VNN | package revision/hash/path and display-ready proposal |
-| Lock | record exact client confirmation and authorization | lock ID, proposal revision/hash, candidate ID |
-| H3 | write/validate prompt and preview; finalize production package | complete sanitized prompt/settings and package binding |
-| Submission/monitor | upload, validate, create one task, and monitor recorded identity | sanitized task status/errors/final links |
+| Intake/state | Inspect, ingest/discover, record feedback, begin revisions, and perform state transitions | Project/run paths, stage, validation summary |
+| Script | Follow `5-scripts`; record five candidates and one selected Final Script | Versions/paths and display-ready tables |
+| Script lock | Publish and lock the explicitly confirmed script | Script revision, candidate, lock ID |
+| Visual | Follow `aggregate-keyframe-generation`; record asset roles, reference decision, scale evidence, panels, and image prompt | Versions/paths and display-ready visual plan |
+| Image | Generate exactly one vertical chronological aggregate Storyboard | Image path/version and preview |
+| Storyboard assembler/lock | Publish an immutable package and record confirmation | Revision/hash/path and lock ID |
+| H3 | Write and validate Ref2VA prompt plus R2V preview | Sanitized prompt/settings and lock binding |
+| Submission/monitor | Upload references, validate, create one task, and monitor it | Sanitized status/errors/final links |
 
-Give each child absolute project/run paths, its exact bounded responsibility, current stage, required artifact versions, and relevant Skill/reference paths. Children record artifacts before returning. The root does not read files to rebuild the returned display payload and never fills in a failed child assignment.
+## Schema v4 Artifacts
 
-## Schema and artifacts
+All versions are append-only. Do not store secrets, tokens, presigned URLs, or upload headers.
 
-New runs use `schema_version: 3`; schema v1/v2 runs retain their old stages, approvals, and candidate-scoped artifacts without migration.
-
-Record source artifacts with `record`; versions are append-only:
-
-| Kind | Contract |
-|---|---|
-| `script` | JSON with verified facts and exactly candidates 1–5 |
-| `dimension-reference` | JSON with `status: provided|missing`; missing has no measurements, `not_to_scale: true`, and the exact display disclaimer |
-| `dimension-reference-image` | visual dimension reference; missing state says `尺寸未提供 / 非按比例` |
-| `aggregate-keyframe-prompt` | prompt for the one package-level keyframe |
-| `aggregate-keyframe` | one borderless blended image for the whole proposal |
-| `client-feedback` | generated only by `record-feedback`; raw reply plus structured impact |
-| `proposal-package` | generated only by `finalize-proposal`; immutable package manifest |
-| `h3-prompt`, `h3-validation`, `task-preview` | locked-proposal H3 preparation |
-| `production-package` | generated only by `finalize-production` |
-| `request`, `request-validation`, `task-result` | exact submission evidence and sanitized result |
-| `asset-upload` | uploaded asset UUID bound to proposal lock and aggregate-keyframe source SHA-256 |
-| `retry-authorization` | generated only by `authorize-retry`; append-only explicit retry audit |
-
-Never store secrets, tokens, presigned URLs, or upload headers.
-
-Each `proposals/VNN/` deliverable contains `proposal.md`, `dimension-reference.json`, its reference image, one aggregate keyframe, and `manifest.json`. The manifest binds parent revision, feedback version, source manifest hash, every component version/path/hash, missing-dimension status, and explicit keyframe reuse reason when applicable. Publishing is atomic; existing package directories and earlier run-level manifests are never overwritten.
+- `script-proposal`: JSON with candidates 1–5. Each has `candidate_id`, `plan_name`, `creative_idea`, `hook`, `source_mapping`, and non-empty `timeline` rows containing `time`, `visual`, `voiceover`, `subtitle`, and `cta`.
+- `script-package`: generated only by `finalize-script-proposal`; publishes `scripts/VNN/` atomically.
+- `final-script`: one selected/revised script with `source_candidate_id`, `plan_name`, `creative_idea`, `hook`, `source_mapping`, and the same timeline row contract. Recording binds the exact script package version and SHA-256; `lock-script` rejects a Final Script from another proposal revision.
+- `script-lock`: generated only by `lock-script`; binds the package, candidate, Final Script hash, confirmation audit, and `Script = LOCKED`.
+- `visual-plan`: JSON with `visual_requirements`, `product_reference_decision`, `asset_roles`, `product_identity_sources`, `scale_reference`, and `storyboard`. Asset roles are Box/Sachet/Bottle Master, Scale Reference, Logo/Text Master, or Scene Reference. Product identity sources may reference only Box/Sachet/Bottle Master entries. Missing scale sets `precise_scale_claimed: false` and includes a post-production recommendation.
+- `aggregate-keyframe-prompt` and `aggregate-keyframe`: bound to the current script lock; the image binds the prompt version.
+- `storyboard-package`: generated only by `finalize-storyboard`; publishes `storyboards/VNN/` atomically and binds the script lock, visual plan, prompt, and image.
+- `storyboard-lock`: generated only by `lock-storyboard`; binds the package and sanitized audit with `create_task_authorized: true`.
+- `h3-prompt`, `h3-validation`, `task-preview`, `production-package`: bound to the Storyboard lock.
+- `asset-upload`: one JSON record per reference with `asset_id`, `storyboard_lock_id`, `source_sha256`, `source_filename`, `asset_role`, `mention_name`, and `reference_description`.
+- `request`, `request-validation`, `task-result`, `retry-authorization`: exact submission and retry evidence.
 
 ## CLI
 
 ```text
-record-feedback RUN_DIR --proposal-version N --source JSON
-begin-revision RUN_DIR --base-revision N --feedback-version V
-finalize-proposal RUN_DIR --script-version V --dimension-version V --dimension-image-version V --keyframe-version V [--base-revision N]
-lock-proposal RUN_DIR --proposal-version N --candidate-id N --approval-json PATH
+record RUN_DIR --kind script-proposal|final-script|visual-plan|aggregate-keyframe-prompt|aggregate-keyframe|h3-prompt|task-preview|asset-upload|request|task-result --source PATH
+finalize-script-proposal RUN_DIR --script-version V [--base-revision N]
+lock-script RUN_DIR --script-proposal-version N --candidate-id 1..5 --final-script-version V --approval-json PATH
+record-feedback RUN_DIR --phase script|storyboard --base-revision N --source JSON
+begin-revision RUN_DIR --phase script|storyboard --base-revision N --feedback-version V
+finalize-storyboard RUN_DIR --visual-plan-version V --keyframe-prompt-version V --keyframe-version V [--base-revision N]
+lock-storyboard RUN_DIR --storyboard-version N --approval-json PATH
+validate-h3-prompt PROMPT --duration N --run-dir RUN_DIR
 finalize-production RUN_DIR
+validate-request REQUEST --run-dir RUN_DIR
 authorize-retry RUN_DIR --approval-json PATH
 ```
 
-Use `record RUN_DIR --kind KIND --source PATH` for ordinary artifacts, `validate-h3-prompt ... --run-dir RUN_DIR` for prompt validation, `validate-request REQUEST --run-dir RUN_DIR` for final request binding, and compare-and-set `set-stage` for permitted transitions.
+Script approval JSON contains `raw_reply`, `confirmed_at`, `channel`, `script_revision`, and `candidate_id`. Storyboard approval contains `raw_reply`, `confirmed_at`, `channel`, `storyboard_revision`, and `create_task_authorized: true`. Retry approval contains the first three audit fields plus `retry_authorized: true`.
 
-`finalize-proposal` is idempotent for the same parent, feedback, and component hashes. A changed package increments the revision. Revision publishing requires bound client feedback. If `affects_visuals: true`, the aggregate keyframe version must change. Pure text feedback may reuse it and records why.
+## Revisions and Locks
 
-## Proposal lock and production binding
+- Script feedback binds the exact base script package. A new script lock supersedes the current downstream working context without changing historical locks or submitted evidence.
+- Storyboard feedback binds the exact base Storyboard package. If `affects_visuals: true`, the aggregate image hash must change. Reuse is allowed only for non-visual metadata feedback and records the reason.
+- Any new task after changed script or Storyboard content requires a new Storyboard lock and authorization.
+- `authorize-retry` is valid only after explicit task failure and returns to `storyboard_locked`; it never changes the approved creative artifacts.
 
-`lock-proposal` requires candidate 1–5 and audit JSON with:
+## Ref2VA/R2V Contract
 
-```json
-{
-  "raw_reply": "确认 V2，选 3，直接生成一个视频",
-  "confirmed_at": "2026-08-30T10:05:00+08:00",
-  "channel": "chat",
-  "client_name": "optional",
-  "proposal_revision": 2,
-  "candidate_id": "3",
-  "create_task_authorized": true
-}
-```
+The final H3 prompt uses these sections in order: `subject_definitions`, `summary`, `retention_analysis`, `detailed_description`, `overall_soundscape`, `non_diegetic_music`.
 
-The immutable lock binds a UUID lock ID, proposal revision/version/SHA-256, selected candidate, and sanitized audit. Locking moves `proposal_review → proposal_locked` and is the only client authority needed for H3 preparation plus one task creation.
+The R2V task preview contains `reference_assets`, each with `source_sha256`, `source_filename`, canonical `asset_role`, unique `mention_name` without `@`, and `reference_description`. The aggregate image uses `source_filename: aggregate-storyboard` and `asset_role: Aggregate Storyboard`. Client assets must match the ingested filename/hash and the role recorded in `visual-plan`; product masters must also appear in `product_identity_sources`. The prompt uses every declared `@mention_name` and contains no `<Picture N>`.
 
-The task preview and production package must bind `proposal_lock_id`, `proposal_revision`, `proposal_package_sha256`, `candidate_id`, `h3_prompt_version`, settings, and idempotency UUID. `finalize-production` verifies the H3 validation and moves to `production_ready`. Request validation additionally records `production_package_version` and rejects any prompt, setting, idempotency, or proposal mismatch.
+The Console request uses `mode: r2v`; every asset uses `role: reference_image`. Request validation binds every asset ID to matching upload evidence and rejects missing, unused, duplicate, or unresolved references.
 
-Before validating the request, the submission child records `asset-upload` JSON with `asset_id`, `proposal_lock_id`, and the locked aggregate keyframe's `source_sha256`; request validation requires the `first_frame` asset ID to match this evidence. The child preserves the same request and idempotency key for uncertain retries. After an explicit failure, no child retries automatically. `authorize-retry` requires raw reply, confirmation time, channel, and `retry_authorized: true`; it creates append-only evidence and requires a new preview/production package and new idempotency UUID before one new attempt.
+Every newly authorized production intent uses an idempotency UUID that has never appeared in an earlier production package. Retrying an uncertain submission reuses the already-recorded exact request directly; it does not finalize another production package.
 
-## State transitions
+## Compatibility
 
-```text
-proposal_review -> proposal_locked -> production_ready -> submitted -> monitoring
-       ^                  |                |                         |-> succeeded
-       +------------------+----------------+                         |-> failed
-failed --explicit retry--> proposal_locked
-any pre-terminal review/production stage --------------------------> cancelled
-```
-
-New feedback after locking or submission starts a new proposal revision and later a new lock. It never edits the earlier lock, production package, request, or task evidence.
-
-## H3 contract
-
-- Use `i2v` with the locked package aggregate keyframe as the only `first_frame`.
-- Start with `For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.`
-- Include `integrated_multimodal_description`, `overall_soundscape`, and `non_diegetic_music` in that order.
-- Use the selected locked script, strictly increasing cut times, verified claims, and configured duration.
-- Validate with the Console validator before task creation.
+New runs use schema v4. Schema v1–v3 runs keep their recorded stages, commands, I2V/proposal contracts, and artifact interpretation. Never rewrite or migrate their state files.

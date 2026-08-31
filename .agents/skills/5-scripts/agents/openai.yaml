@@ -1,0 +1,6 @@
+interface:
+  display_name: "Five Ad Scripts"
+  short_description: "Create five Malaysian Chinese ad script directions"
+  default_prompt: "Use $5-scripts to turn my client materials into five distinct short-video scripts and help me lock one Final Script."
+policy:
+  allow_implicit_invocation: true

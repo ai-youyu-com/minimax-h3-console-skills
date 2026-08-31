@@ -1,7 +1,7 @@
 interface:
   display_name: "Generate Client Ad Video"
-  short_description: "Build versioned client proposals and one locked H3 task"
-  default_prompt: "Use $generate-client-ad-video to delegate a versioned client proposal package with five scripts, dimensions, and one aggregate keyframe. Apply client feedback as new immutable versions, then lock the confirmed package and create one H3 task. Keep this conversation orchestration-only."
+  short_description: "Lock five-script, Storyboard, and R2V production stages"
+  default_prompt: "Use $generate-client-ad-video to build five script options, lock one Final Script, confirm one aggregate Storyboard, and create one authorized R2V H3 task."
 dependencies:
   tools:
     - type: "mcp"

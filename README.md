@@ -15,7 +15,13 @@ MiniMax H3 的提示词规范和创作类 Skills 来源于 [MiniMax-AI/MiniMax-H
 - 查询任务进度和最终视频链接；
 - 重试失败任务或取消可取消的任务。
 
-仓库还提供 `generate-client-ad-video`：用户既可以在项目目录中放置 `ad-brief.md` 和同级图片，也可以直接在对话中描述产品并上传图片。Skill 会把聊天信息和附件保存成标准本地项目，再通过三次固定选项确认完成广告脚本、聚合关键帧和 H3 视频任务。
+仓库还提供三个可组合的客户广告 Skill：
+
+- `5-scripts`：从客户资料生成五个不同方向的短视频脚本，并锁定一个 Final Script；
+- `aggregate-keyframe-generation`：从锁定脚本规划一张按时间顺序排列的 9:16 聚合 Storyboard；
+- `generate-client-ad-video`：把脚本、Storyboard、Ref2VA/R2V 生产包和一个已授权视频任务编排成带版本与审计的端到端流程。
+
+用户既可以在项目目录中放置 `ad-brief.md` 和同级图片，也可以直接在对话中描述产品并上传图片。新运行采用 schema v4；旧 v1–v3 运行按原状态恢复，不自动迁移。
 
 生成视频时，建议先由官方 `h3-prompt-writing` Skill 按照 H3 规范组织时间轴、镜头、对白、环境声音和音乐，再由 Console Skill 将提示词与素材转换成 MCP 接受的任务格式。
 
@@ -75,10 +81,17 @@ npx skills add MiniMax-AI/MiniMax-H3 --skill '*' --agent codex
 npx skills add MiniMax-AI/MiniMax-H3 --skill h3-prompt-writing
 ```
 
-若要安装文件驱动的客户广告工作流：
+若要安装完整客户广告工作流：
 
 ```bash
 npx skills add ai-youyu-com/minimax-h3-console-skills --skill generate-client-ad-video
+```
+
+两个阶段 Skill 也可以独立安装和调用：
+
+```bash
+npx skills add ai-youyu-com/minimax-h3-console-skills --skill 5-scripts
+npx skills add ai-youyu-com/minimax-h3-console-skills --skill aggregate-keyframe-generation
 ```
 
 在任意项目子目录中放置以下文件后，调用 `$generate-client-ad-video`：
@@ -136,6 +149,12 @@ skills/
 │   ├── agents/
 │   ├── references/
 │   └── scripts/
+├── 5-scripts/
+│   ├── SKILL.md
+│   └── agents/
+├── aggregate-keyframe-generation/
+│   ├── SKILL.md
+│   └── agents/
 └── minimax-h3-console-video-generator/
     ├── SKILL.md
     ├── agents/

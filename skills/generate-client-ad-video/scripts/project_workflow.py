@@ -21,7 +21,7 @@ from typing import Any
 BRIEF_NAME = "ad-brief.md"
 SUPPORTED_IMAGES = {".png", ".jpg", ".jpeg", ".webp"}
 REPLACEMENT_STEM = "approved-keyframe"
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 CANDIDATE_IDS = tuple(str(index) for index in range(1, 6))
 SCRIPT_CANDIDATE_FIELDS = {
     "candidate_id",
@@ -32,6 +32,15 @@ SCRIPT_CANDIDATE_FIELDS = {
     "source_mapping",
     "post_production_text",
 }
+V4_SCRIPT_CANDIDATE_FIELDS = {
+    "candidate_id",
+    "plan_name",
+    "creative_idea",
+    "hook",
+    "timeline",
+    "source_mapping",
+}
+V4_TIMELINE_FIELDS = {"time", "visual", "voiceover", "subtitle", "cta"}
 TERMINAL_STAGES = {"succeeded", "cancelled"}
 ALLOWED_STAGES = {
     "script_review",
@@ -45,6 +54,9 @@ ALLOWED_STAGES = {
     "proposal_review",
     "proposal_locked",
     "production_ready",
+    "script_locked",
+    "storyboard_review",
+    "storyboard_locked",
 }
 TRANSITIONS = {
     "script_review": {"cancelled"},
@@ -58,6 +70,9 @@ TRANSITIONS = {
     "proposal_review": {"proposal_locked", "cancelled"},
     "proposal_locked": {"production_ready", "proposal_review", "cancelled"},
     "production_ready": {"submitted", "proposal_review", "cancelled"},
+    "script_locked": {"storyboard_review", "script_review", "cancelled"},
+    "storyboard_review": {"storyboard_locked", "script_review", "cancelled"},
+    "storyboard_locked": {"production_ready", "storyboard_review", "script_review", "cancelled"},
 }
 ARTIFACT_KINDS = {
     "script",
@@ -78,6 +93,13 @@ ARTIFACT_KINDS = {
     "production-package",
     "asset-upload",
     "retry-authorization",
+    "script-proposal",
+    "script-package",
+    "final-script",
+    "script-lock",
+    "visual-plan",
+    "storyboard-package",
+    "storyboard-lock",
 }
 SENSITIVE_KEYS = {
     "authorization",
@@ -582,7 +604,7 @@ def atomic_json_write(path: Path, data: Any) -> None:
     temp.replace(path)
 
 
-def start_run(project: Path, run_id: str | None = None) -> dict[str, Any]:
+def start_run(project: Path, run_id: str | None = None, schema_version_override: int | None = None) -> dict[str, Any]:
     inspection = inspect_project(project)
     if not inspection["valid"]:
         raise WorkflowError("项目校验失败: " + "; ".join(inspection["errors"]))
@@ -597,15 +619,19 @@ def start_run(project: Path, run_id: str | None = None) -> dict[str, Any]:
     manifest_path = run_dir / "manifest.json"
     state_path = run_dir / "state.json"
     atomic_json_write(manifest_path, inspection)
+    run_schema = schema_version_override or CURRENT_SCHEMA_VERSION
+    if run_schema not in {1, 2, 3, 4}:
+        raise WorkflowError("schema version 必须是 1、2、3 或 4")
+    initial_stage = "proposal_review" if run_schema == 3 else "script_review"
     state = {
-        "schema_version": CURRENT_SCHEMA_VERSION,
+        "schema_version": run_schema,
         "run_id": run_id,
         "project_dir": inspection["project_dir"],
-        "stage": "proposal_review",
+        "stage": initial_stage,
         "created_at": created,
         "updated_at": created,
         "artifacts": {},
-        "history": [{"at": created, "event": "run_started", "stage": "proposal_review"}],
+        "history": [{"at": created, "event": "run_started", "stage": initial_stage}],
     }
     atomic_json_write(state_path, state)
     return {"run_dir": str(run_dir.resolve()), "manifest": str(manifest_path), "state": state}
@@ -673,6 +699,109 @@ def validate_script_set(path: Path) -> tuple[str, ...]:
     if tuple(ids) != CANDIDATE_IDS:
         raise WorkflowError("script candidates 必须按 1、2、3、4、5 排列且不得重复")
     return tuple(ids)
+
+
+def validate_v4_timeline(value: Any, label: str) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or not value:
+        raise WorkflowError(f"{label}.timeline 必须是非空数组")
+    for index, row in enumerate(value):
+        if not isinstance(row, dict):
+            raise WorkflowError(f"{label}.timeline[{index}] 必须是对象")
+        missing = sorted(field for field in V4_TIMELINE_FIELDS if field not in row)
+        if missing:
+            raise WorkflowError(f"{label}.timeline[{index}] 缺少字段: " + ", ".join(missing))
+        if any(row[field] is None for field in V4_TIMELINE_FIELDS):
+            raise WorkflowError(f"{label}.timeline[{index}] 字段不得为 null")
+    return value
+
+
+def validate_script_proposal(path: Path) -> dict[str, Any]:
+    payload = read_json_file(path, "script-proposal")
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list) or len(candidates) != len(CANDIDATE_IDS):
+        raise WorkflowError("script-proposal 必须恰好包含 5 个候选")
+    ids: list[str] = []
+    for item in candidates:
+        if not isinstance(item, dict):
+            raise WorkflowError("script-proposal.candidates 的每一项都必须是对象")
+        missing = sorted(
+            field for field in V4_SCRIPT_CANDIDATE_FIELDS
+            if field not in item or item[field] in (None, "", [])
+        )
+        if missing:
+            raise WorkflowError("script-proposal candidate 缺少字段: " + ", ".join(missing))
+        candidate_id = validate_candidate_id(str(item.get("candidate_id")))
+        validate_v4_timeline(item.get("timeline"), f"候选 {candidate_id}")
+        ids.append(candidate_id)
+    if tuple(ids) != CANDIDATE_IDS:
+        raise WorkflowError("script-proposal candidates 必须按 1、2、3、4、5 排列且不得重复")
+    return payload
+
+
+def validate_final_script(path: Path) -> dict[str, Any]:
+    payload = read_json_file(path, "final-script")
+    validate_candidate_id(str(payload.get("source_candidate_id")))
+    for field in ("plan_name", "creative_idea", "hook", "source_mapping"):
+        if payload.get(field) in (None, "", []):
+            raise WorkflowError(f"final-script 缺少字段: {field}")
+    validate_v4_timeline(payload.get("timeline"), "final-script")
+    return payload
+
+
+def validate_visual_plan(path: Path) -> dict[str, Any]:
+    payload = read_json_file(path, "visual-plan")
+    required = ("visual_requirements", "product_reference_decision", "asset_roles", "product_identity_sources", "scale_reference", "storyboard")
+    if any(field not in payload or payload.get(field) is None for field in required):
+        raise WorkflowError("visual-plan 缺少必需字段: " + ", ".join(field for field in required if field not in payload or payload.get(field) is None))
+    decision = payload["product_reference_decision"]
+    if not isinstance(decision, dict) or not isinstance(decision.get("required"), bool):
+        raise WorkflowError("visual-plan.product_reference_decision.required 必须是布尔值")
+    if not isinstance(payload["asset_roles"], list):
+        raise WorkflowError("visual-plan.asset_roles 必须是数组")
+    allowed_roles = {"Box Master", "Sachet Master", "Bottle Master", "Scale Reference", "Logo/Text Master", "Scene Reference"}
+    role_by_filename: dict[str, str] = {}
+    for item in payload["asset_roles"]:
+        if not isinstance(item, dict) or item.get("role") not in allowed_roles or not item.get("filename"):
+            raise WorkflowError("visual-plan.asset_roles 必须包含有效 filename 和素材角色")
+        role_by_filename[str(item["filename"])] = str(item["role"])
+    identity_sources = payload["product_identity_sources"]
+    if not isinstance(identity_sources, list):
+        raise WorkflowError("visual-plan.product_identity_sources 必须是数组")
+    if decision["required"] and not identity_sources:
+        raise WorkflowError("需要产品参考时 product_identity_sources 不能为空")
+    for filename in identity_sources:
+        if role_by_filename.get(str(filename)) not in {"Box Master", "Sachet Master", "Bottle Master"}:
+            raise WorkflowError("产品身份依据只能使用 Box/Sachet/Bottle Master，不能使用 Scene Reference")
+    scale = payload["scale_reference"]
+    if not isinstance(scale, dict) or scale.get("status") not in {"provided", "missing", "not_required"}:
+        raise WorkflowError("visual-plan.scale_reference.status 必须是 provided、missing 或 not_required")
+    if scale.get("status") == "missing":
+        if scale.get("precise_scale_claimed") is not False:
+            raise WorkflowError("缺少 Scale Reference 时 precise_scale_claimed 必须为 false")
+        if not scale.get("postproduction_recommendation"):
+            raise WorkflowError("缺少 Scale Reference 时必须给出真实素材后期合成建议")
+    elif scale.get("status") == "provided":
+        if role_by_filename.get(str(scale.get("source_filename"))) != "Scale Reference":
+            raise WorkflowError("已提供比例参考时 source_filename 必须指向 Scale Reference")
+        if not scale.get("relative_scale_constraints"):
+            raise WorkflowError("已提供比例参考时必须记录 relative_scale_constraints")
+    storyboard = payload["storyboard"]
+    if not isinstance(storyboard, list) or not storyboard:
+        raise WorkflowError("visual-plan.storyboard 必须是非空数组")
+    for index, panel in enumerate(storyboard):
+        if not isinstance(panel, dict) or any(panel.get(field) in (None, "") for field in ("time", "person", "environment", "action", "product", "visual_elements")):
+            raise WorkflowError(f"visual-plan.storyboard[{index}] 必须明确人物、环境、动作、产品和重要视觉元素")
+    return payload
+
+
+def read_json_file(path: Path, label: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise WorkflowError(f"{label} 必须是有效 JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise WorkflowError(f"{label} 根节点必须是对象")
+    return payload
 
 
 def validate_dimension_reference(path: Path) -> dict[str, Any]:
@@ -926,10 +1055,306 @@ def validate_task_preview(
     return payload
 
 
-def record_feedback(run_dir: Path, proposal_version: int, source: Path) -> dict[str, Any]:
+def script_package_entry(state: dict[str, Any], revision: int | None = None) -> dict[str, Any]:
+    entries = state.get("artifacts", {}).get("script-package", [])
+    if revision is None:
+        if not entries:
+            raise WorkflowError("缺少 script-package")
+        return entries[-1]
+    for entry in entries:
+        if entry.get("script_revision") == revision:
+            return entry
+    raise WorkflowError(f"找不到脚本提案 V{revision:02d}")
+
+
+def storyboard_package_entry(state: dict[str, Any], revision: int | None = None) -> dict[str, Any]:
+    entries = state.get("artifacts", {}).get("storyboard-package", [])
+    if revision is None:
+        if not entries:
+            raise WorkflowError("缺少 storyboard-package")
+        return entries[-1]
+    for entry in entries:
+        if entry.get("storyboard_revision") == revision:
+            return entry
+    raise WorkflowError(f"找不到 Storyboard V{revision:02d}")
+
+
+def render_script_markdown(revision: int, payload: dict[str, Any]) -> str:
+    lines = [f"# 五个脚本方案 V{revision}", ""]
+    for item in payload["candidates"]:
+        lines.extend([
+            f"## {item['candidate_id']}. {item['plan_name']}", "",
+            item["creative_idea"], "", f"**Hook:** {item['hook']}", "",
+            "| 时间 | 画面 | 口播 | 字幕/花字 | CTA |", "|---|---|---|---|---|",
+        ])
+        for row in item["timeline"]:
+            cells = [str(row[field]).replace("|", "\\|").replace("\n", "<br>") for field in ("time", "visual", "voiceover", "subtitle", "cta")]
+            lines.append("| " + " | ".join(cells) + " |")
+        lines.extend(["", "来源映射：`" + json.dumps(item["source_mapping"], ensure_ascii=False) + "`", ""])
+    return "\n".join(lines)
+
+
+def finalize_script_proposal(run_dir: Path, script_version: int, base_revision: int | None = None) -> dict[str, Any]:
     state_path, state = load_state(run_dir)
+    if schema_version(state) != 4 or state.get("stage") != "script_review":
+        raise WorkflowError("finalize-script-proposal 只能在 schema v4 的 script_review 阶段执行")
+    script = artifact_entry(state, "script-proposal", script_version)
+    payload = validate_script_proposal(verify_artifact_integrity(script, "script-proposal"))
+    active = state.get("active_revision") or {}
+    if base_revision is None and active.get("phase") == "script":
+        base_revision = active.get("base_revision")
+    feedback_version = active.get("feedback_version") if base_revision is not None and active.get("phase") == "script" else None
+    if base_revision is not None:
+        script_package_entry(state, base_revision)
+        if not feedback_version:
+            raise WorkflowError("发布脚本修订版前必须绑定 script 阶段客户反馈")
+        feedback = artifact_entry(state, "client-feedback", feedback_version)
+        if feedback.get("phase") != "script" or feedback.get("base_revision") != base_revision:
+            raise WorkflowError("当前反馈不属于指定脚本版本")
+    else:
+        feedback = None
+        if state.get("artifacts", {}).get("script-package"):
+            raise WorkflowError("后续脚本版本必须通过 begin-revision 绑定客户反馈")
+    revision = len(state.get("artifacts", {}).get("script-package", [])) + 1
+    root = run_dir.resolve() / "scripts"
+    final_dir = root / f"V{revision:02d}"
+    temp_dir = root / f".V{revision:02d}-{uuid.uuid4().hex}.tmp"
+    root.mkdir(exist_ok=True)
+    if final_dir.exists():
+        raise WorkflowError(f"脚本提案目录已存在: {final_dir}")
+    temp_dir.mkdir()
+    try:
+        shutil.copy2(script["path"], temp_dir / "script-proposal.json")
+        (temp_dir / "proposal.md").write_text(render_script_markdown(revision, payload), encoding="utf-8")
+        package = {
+            "schema_version": 4,
+            "script_revision": revision,
+            "parent_revision": base_revision,
+            "feedback_version": feedback_version,
+            "client_feedback": component_binding(feedback) if feedback else None,
+            "source_manifest_sha256": sha256_file(run_dir.resolve() / "manifest.json"),
+            "components": {"script_proposal": component_binding(script)},
+            "created_at": now_iso(),
+        }
+        atomic_json_write(temp_dir / "manifest.json", package)
+        temp_dir.replace(final_dir)
+    except Exception:
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+        raise
+    entries = state.setdefault("artifacts", {}).setdefault("script-package", [])
+    package_path = final_dir / "manifest.json"
+    timestamp = now_iso()
+    entry = {"version": len(entries) + 1, "script_revision": revision, "path": str(package_path), "sha256": sha256_file(package_path), "recorded_at": timestamp, "deliverable_dir": str(final_dir)}
+    entries.append(entry)
+    state.pop("active_revision", None)
+    state["updated_at"] = timestamp
+    state.setdefault("history", []).append({"at": timestamp, "event": "script_proposal_finalized", "script_revision": revision})
+    atomic_json_write(state_path, state)
+    return entry
+
+
+def lock_script(run_dir: Path, script_proposal_version: int, candidate_id: str, final_script_version: int, approval_json: Path) -> dict[str, Any]:
+    state_path, state = load_state(run_dir)
+    if schema_version(state) != 4 or state.get("stage") != "script_review":
+        raise WorkflowError("lock-script 只能在 schema v4 的 script_review 阶段执行")
+    package = script_package_entry(state, script_proposal_version)
+    candidate_id = validate_candidate_id(candidate_id)
+    final_script = artifact_entry(state, "final-script", final_script_version)
+    final_payload = validate_final_script(verify_artifact_integrity(final_script, "final-script"))
+    if final_script.get("script_package_version") != package["version"] or final_script.get("script_package_sha256") != package["sha256"]:
+        raise WorkflowError("final-script 未绑定所选 script package 版本")
+    if str(final_payload["source_candidate_id"]) != candidate_id:
+        raise WorkflowError("final-script.source_candidate_id 与选择的候选不一致")
+    proposal_payload = read_json_artifact(package, "script-package")
+    proposal = read_json_artifact(proposal_payload["components"]["script_proposal"], "script-proposal")
+    if candidate_id not in {str(item["candidate_id"]) for item in proposal["candidates"]}:
+        raise WorkflowError("选择的候选不在脚本提案中")
+    audit = read_json_file(approval_json, "script approval")
+    if any(audit.get(field) in (None, "") for field in ("raw_reply", "confirmed_at", "channel")):
+        raise WorkflowError("脚本确认审计必须包含 raw_reply、confirmed_at 和 channel")
+    if audit.get("script_revision", script_proposal_version) != script_proposal_version or str(audit.get("candidate_id", candidate_id)) != candidate_id:
+        raise WorkflowError("脚本确认审计中的版本或候选 ID 与命令不一致")
+    timestamp = now_iso()
+    lock_id = str(uuid.uuid4())
+    lock_payload = sanitize_json({
+        "lock_id": lock_id,
+        "script_revision": script_proposal_version,
+        "script_package_sha256": package["sha256"],
+        "candidate_id": candidate_id,
+        "final_script": component_binding(final_script),
+        "status": "Script = LOCKED",
+        "audit": {**audit, "script_revision": script_proposal_version, "candidate_id": candidate_id},
+        "locked_at": timestamp,
+    })
+    entries = state.setdefault("artifacts", {}).setdefault("script-lock", [])
+    version = len(entries) + 1
+    destination = run_dir.resolve() / f"script-lock-v{version:02d}.json"
+    atomic_json_write(destination, lock_payload)
+    entry = {"version": version, "path": str(destination), "sha256": sha256_file(destination), "recorded_at": timestamp, "lock_id": lock_id, "script_revision": script_proposal_version, "candidate_id": candidate_id, "final_script_version": final_script_version}
+    entries.append(entry)
+    state.setdefault("script_locks", []).append(lock_payload)
+    state.setdefault("approvals", {})["script"] = lock_payload
+    state["stage"] = "script_locked"
+    state["updated_at"] = timestamp
+    state.setdefault("history", []).append({"at": timestamp, "event": "script_locked", "lock_id": lock_id, "script_revision": script_proposal_version, "candidate_id": candidate_id})
+    atomic_json_write(state_path, state)
+    return state
+
+
+def render_storyboard_markdown(revision: int, visual: dict[str, Any], keyframe_name: str) -> str:
+    lines = [f"# 聚合 Storyboard V{revision}", "", "## A. Visual Requirements", "", json.dumps(visual["visual_requirements"], ensure_ascii=False, indent=2), "", "## B. Product Reference Decision", "", json.dumps(visual["product_reference_decision"], ensure_ascii=False, indent=2), "", "## C. Storyboard", ""]
+    for index, panel in enumerate(visual["storyboard"], 1):
+        lines.append(f"- Panel {index} ({panel['time']}): {panel['person']}；{panel['environment']}；{panel['action']}；{panel['product']}；{panel['visual_elements']}")
+    lines.extend(["", "## Aggregate Storyboard", "", f"![Aggregate Storyboard]({keyframe_name})", ""])
+    return "\n".join(lines)
+
+
+def finalize_storyboard(run_dir: Path, visual_plan_version: int, keyframe_prompt_version: int, keyframe_version: int, base_revision: int | None = None) -> dict[str, Any]:
+    state_path, state = load_state(run_dir)
+    if schema_version(state) != 4 or state.get("stage") != "storyboard_review":
+        raise WorkflowError("finalize-storyboard 只能在 schema v4 的 storyboard_review 阶段执行")
+    script_lock = state.get("approvals", {}).get("script")
+    if not script_lock:
+        raise WorkflowError("生成 Storyboard 前必须锁定 Final Script")
+    visual = artifact_entry(state, "visual-plan", visual_plan_version)
+    prompt = artifact_entry(state, "aggregate-keyframe-prompt", keyframe_prompt_version)
+    keyframe = artifact_entry(state, "aggregate-keyframe", keyframe_version)
+    visual_payload = validate_visual_plan(verify_artifact_integrity(visual, "visual-plan"))
+    for entry, label in ((visual, "visual-plan"), (prompt, "aggregate-keyframe-prompt"), (keyframe, "aggregate-keyframe")):
+        if entry.get("script_lock_id") != script_lock["lock_id"]:
+            raise WorkflowError(f"{label} 未绑定当前 script lock")
+    if keyframe.get("keyframe_prompt_version") != prompt["version"]:
+        raise WorkflowError("aggregate-keyframe 未绑定所选图片 Prompt")
+    if Path(keyframe["path"]).suffix.casefold() not in SUPPORTED_IMAGES:
+        raise WorkflowError("aggregate-keyframe 必须是支持的图片格式")
+    active = state.get("active_revision") or {}
+    if base_revision is None and active.get("phase") == "storyboard":
+        base_revision = active.get("base_revision")
+    feedback_version = active.get("feedback_version") if base_revision is not None and active.get("phase") == "storyboard" else None
+    if base_revision is not None:
+        base = storyboard_package_entry(state, base_revision)
+        if not feedback_version:
+            raise WorkflowError("发布 Storyboard 修订版前必须绑定 storyboard 阶段反馈")
+        feedback = artifact_entry(state, "client-feedback", feedback_version)
+        if feedback.get("phase") != "storyboard" or feedback.get("base_revision") != base_revision:
+            raise WorkflowError("当前反馈不属于指定 Storyboard 版本")
+        base_payload = read_json_artifact(base, "storyboard-package")
+        if feedback.get("affects_visuals") and base_payload["components"]["aggregate_keyframe"]["sha256"] == keyframe["sha256"]:
+            raise WorkflowError("视觉相关反馈必须生成新的聚合 Storyboard")
+    else:
+        base = None
+        feedback = None
+        if state.get("artifacts", {}).get("storyboard-package"):
+            raise WorkflowError("后续 Storyboard 版本必须通过 begin-revision 绑定客户反馈")
+    revision = len(state.get("artifacts", {}).get("storyboard-package", [])) + 1
+    components = {"visual_plan": component_binding(visual), "aggregate_keyframe_prompt": component_binding(prompt), "aggregate_keyframe": component_binding(keyframe)}
+    root = run_dir.resolve() / "storyboards"
+    final_dir = root / f"V{revision:02d}"
+    temp_dir = root / f".V{revision:02d}-{uuid.uuid4().hex}.tmp"
+    root.mkdir(exist_ok=True)
+    if final_dir.exists():
+        raise WorkflowError(f"Storyboard 目录已存在: {final_dir}")
+    temp_dir.mkdir()
+    try:
+        keyframe_name = "aggregate-storyboard" + Path(keyframe["path"]).suffix.casefold()
+        shutil.copy2(visual["path"], temp_dir / "visual-plan.json")
+        shutil.copy2(prompt["path"], temp_dir / "image-prompt.txt")
+        shutil.copy2(keyframe["path"], temp_dir / keyframe_name)
+        (temp_dir / "storyboard.md").write_text(render_storyboard_markdown(revision, visual_payload, keyframe_name), encoding="utf-8")
+        package = {
+            "schema_version": 4,
+            "storyboard_revision": revision,
+            "parent_revision": base_revision,
+            "feedback_version": feedback_version,
+            "client_feedback": component_binding(feedback) if feedback else None,
+            "script_lock_id": script_lock["lock_id"],
+            "final_script": script_lock["final_script"],
+            "components": components,
+            "keyframe_reuse": bool(base and read_json_artifact(base, "storyboard-package")["components"]["aggregate_keyframe"]["sha256"] == keyframe["sha256"]),
+            "keyframe_reuse_reason": "非视觉元数据反馈" if base and feedback and not feedback.get("affects_visuals") and read_json_artifact(base, "storyboard-package")["components"]["aggregate_keyframe"]["sha256"] == keyframe["sha256"] else None,
+            "created_at": now_iso(),
+        }
+        atomic_json_write(temp_dir / "manifest.json", package)
+        temp_dir.replace(final_dir)
+    except Exception:
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+        raise
+    entries = state.setdefault("artifacts", {}).setdefault("storyboard-package", [])
+    package_path = final_dir / "manifest.json"
+    timestamp = now_iso()
+    entry = {"version": len(entries) + 1, "storyboard_revision": revision, "path": str(package_path), "sha256": sha256_file(package_path), "recorded_at": timestamp, "script_lock_id": script_lock["lock_id"], "deliverable_dir": str(final_dir)}
+    entries.append(entry)
+    state.pop("active_revision", None)
+    state["updated_at"] = timestamp
+    state.setdefault("history", []).append({"at": timestamp, "event": "storyboard_finalized", "storyboard_revision": revision})
+    atomic_json_write(state_path, state)
+    return entry
+
+
+def lock_storyboard(run_dir: Path, storyboard_version: int, approval_json: Path) -> dict[str, Any]:
+    state_path, state = load_state(run_dir)
+    if schema_version(state) != 4 or state.get("stage") != "storyboard_review":
+        raise WorkflowError("lock-storyboard 只能在 schema v4 的 storyboard_review 阶段执行")
+    package = storyboard_package_entry(state, storyboard_version)
+    payload = read_json_artifact(package, "storyboard-package")
+    script_lock = state.get("approvals", {}).get("script")
+    if not script_lock or payload.get("script_lock_id") != script_lock.get("lock_id"):
+        raise WorkflowError("Storyboard 未绑定当前 Final Script")
+    audit = read_json_file(approval_json, "storyboard approval")
+    if any(audit.get(field) in (None, "") for field in ("raw_reply", "confirmed_at", "channel")):
+        raise WorkflowError("Storyboard 确认审计必须包含 raw_reply、confirmed_at 和 channel")
+    if audit.get("create_task_authorized") is not True:
+        raise WorkflowError("Storyboard 确认必须明确 create_task_authorized: true")
+    if audit.get("storyboard_revision", storyboard_version) != storyboard_version:
+        raise WorkflowError("确认审计中的 Storyboard 版本与命令不一致")
+    timestamp = now_iso()
+    lock_id = str(uuid.uuid4())
+    lock_payload = sanitize_json({"lock_id": lock_id, "storyboard_revision": storyboard_version, "storyboard_package_sha256": package["sha256"], "script_lock_id": script_lock["lock_id"], "candidate_id": script_lock["candidate_id"], "audit": {**audit, "storyboard_revision": storyboard_version, "create_task_authorized": True}, "locked_at": timestamp})
+    entries = state.setdefault("artifacts", {}).setdefault("storyboard-lock", [])
+    version = len(entries) + 1
+    destination = run_dir.resolve() / f"storyboard-lock-v{version:02d}.json"
+    atomic_json_write(destination, lock_payload)
+    entries.append({"version": version, "path": str(destination), "sha256": sha256_file(destination), "recorded_at": timestamp, "lock_id": lock_id, "storyboard_revision": storyboard_version})
+    state.setdefault("storyboard_locks", []).append(lock_payload)
+    state.setdefault("approvals", {})["storyboard"] = lock_payload
+    state["stage"] = "storyboard_locked"
+    state["updated_at"] = timestamp
+    state.setdefault("history", []).append({"at": timestamp, "event": "storyboard_locked", "lock_id": lock_id, "storyboard_revision": storyboard_version})
+    atomic_json_write(state_path, state)
+    return state
+
+
+def record_feedback(run_dir: Path, proposal_version: int, source: Path, phase: str | None = None) -> dict[str, Any]:
+    state_path, state = load_state(run_dir)
+    if schema_version(state) == 4:
+        if phase not in {"script", "storyboard"}:
+            raise WorkflowError("schema v4 的 record-feedback 必须指定 phase: script 或 storyboard")
+        if phase == "script":
+            script_package_entry(state, proposal_version)
+        else:
+            storyboard_package_entry(state, proposal_version)
+        payload = validate_feedback_payload(source)
+        declared = payload.get("base_revision", proposal_version)
+        if declared != proposal_version:
+            raise WorkflowError("反馈中的 base_revision 与目标版本不一致")
+        payload.update({"phase": phase, "base_revision": proposal_version})
+        entries = state.setdefault("artifacts", {}).setdefault("client-feedback", [])
+        version = len(entries) + 1
+        destination = run_dir.resolve() / f"client-feedback-v{version:02d}.json"
+        if destination.exists():
+            raise WorkflowError(f"产物目标已存在: {destination}")
+        atomic_json_write(destination, payload)
+        timestamp = now_iso()
+        entry = {"version": version, "path": str(destination), "sha256": sha256_file(destination), "recorded_at": timestamp, "phase": phase, "base_revision": proposal_version, "affects_visuals": payload["affects_visuals"]}
+        entries.append(entry)
+        state["updated_at"] = timestamp
+        state.setdefault("history", []).append({"at": timestamp, "event": "client_feedback_recorded", "version": version, "phase": phase, "base_revision": proposal_version})
+        atomic_json_write(state_path, state)
+        return entry
     if schema_version(state) != 3:
-        raise WorkflowError("record-feedback 仅适用于 schema v3")
+        raise WorkflowError("record-feedback 仅适用于 schema v3/v4")
     proposal = proposal_entry(state, proposal_version)
     payload = validate_feedback_payload(source)
     declared = payload.get("proposal_revision", proposal_version)
@@ -951,10 +1376,31 @@ def record_feedback(run_dir: Path, proposal_version: int, source: Path) -> dict[
     return entry
 
 
-def begin_revision(run_dir: Path, base_revision: int, feedback_version: int) -> dict[str, Any]:
+def begin_revision(run_dir: Path, base_revision: int, feedback_version: int, phase: str | None = None) -> dict[str, Any]:
     state_path, state = load_state(run_dir)
+    if schema_version(state) == 4:
+        if phase not in {"script", "storyboard"}:
+            raise WorkflowError("schema v4 的 begin-revision 必须指定 phase: script 或 storyboard")
+        if phase == "script":
+            script_package_entry(state, base_revision)
+        else:
+            storyboard_package_entry(state, base_revision)
+        feedback = artifact_entry(state, "client-feedback", feedback_version)
+        if feedback.get("phase") != phase or feedback.get("base_revision") != base_revision:
+            raise WorkflowError("反馈版本不属于指定阶段和基础版本")
+        allowed = {"script_review", "storyboard_review", "script_locked", "storyboard_locked", "production_ready", "submitted", "monitoring", "succeeded", "failed"}
+        if state.get("stage") not in allowed:
+            raise WorkflowError("当前阶段不能开始修订")
+        state["active_revision"] = {"phase": phase, "base_revision": base_revision, "feedback_version": feedback_version, "started_at": now_iso()}
+        state["stage"] = "script_review" if phase == "script" else "storyboard_review"
+        if phase == "script":
+            state.get("approvals", {}).pop("storyboard", None)
+        state["updated_at"] = now_iso()
+        state.setdefault("history", []).append({"at": state["updated_at"], "event": f"{phase}_revision_started", "base_revision": base_revision, "feedback_version": feedback_version})
+        atomic_json_write(state_path, state)
+        return state
     if schema_version(state) != 3:
-        raise WorkflowError("begin-revision 仅适用于 schema v3")
+        raise WorkflowError("begin-revision 仅适用于 schema v3/v4")
     proposal_entry(state, base_revision)
     feedback = artifact_entry(state, "client-feedback", feedback_version)
     if feedback.get("proposal_revision") != base_revision:
@@ -1116,8 +1562,148 @@ def lock_proposal(run_dir: Path, proposal_version: int, candidate_id: str, appro
     return state
 
 
+def validate_v4_task_preview(
+    payload: dict[str, Any],
+    prompt_text: str,
+    aggregate_sha256: str,
+    manifest_assets: list[dict[str, Any]],
+    visual_plan: dict[str, Any],
+) -> list[dict[str, Any]]:
+    errors: list[str] = []
+    if payload.get("mode") != "r2v":
+        errors.append("mode 必须是 r2v")
+    if not is_uuid(payload.get("workspace_id")):
+        errors.append("workspace_id 必须是 UUID")
+    if not is_uuid(payload.get("idempotency_key")):
+        errors.append("idempotency_key 必须是 UUID")
+    duration = payload.get("duration_seconds")
+    if isinstance(duration, bool) or not isinstance(duration, (int, float)) or not 4 <= duration <= 15:
+        errors.append("duration_seconds 必须在 4 到 15 秒之间")
+    if payload.get("aspect_ratio") not in {"16:9", "9:16", "1:1"}:
+        errors.append("aspect_ratio 无效")
+    if payload.get("quality") not in {"high", "standard"}:
+        errors.append("quality 无效")
+    if not isinstance(payload.get("execution_backend"), str) or not payload["execution_backend"].strip():
+        errors.append("execution_backend 不能为空")
+    assets = payload.get("reference_assets")
+    if not isinstance(assets, list) or not assets:
+        errors.append("reference_assets 必须是非空数组")
+        assets = []
+    names: list[str] = []
+    hashes: list[str] = []
+    manifest_by_filename = {str(item.get("filename")): item for item in manifest_assets if item.get("filename")}
+    role_by_filename = {str(item["filename"]): str(item["role"]) for item in visual_plan.get("asset_roles", []) if isinstance(item, dict) and item.get("filename") and item.get("role")}
+    identity_sources = {str(value) for value in visual_plan.get("product_identity_sources", [])}
+    for index, item in enumerate(assets):
+        if not isinstance(item, dict):
+            errors.append(f"reference_assets[{index}] 必须是对象")
+            continue
+        name = item.get("mention_name")
+        source_hash = item.get("source_sha256")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_\-\u3400-\u4dbf\u4e00-\u9fff]+", name) or name.startswith("@"):
+            errors.append(f"reference_assets[{index}].mention_name 无效")
+        else:
+            names.append(name)
+            if f"@{name}" not in prompt_text:
+                errors.append(f"H3 prompt 未引用 @{name}")
+        source_filename = item.get("source_filename")
+        asset_role = item.get("asset_role")
+        if source_hash == aggregate_sha256:
+            if asset_role != "Aggregate Storyboard" or source_filename != "aggregate-storyboard":
+                errors.append(f"reference_assets[{index}] 的聚合图必须标记为 Aggregate Storyboard / aggregate-storyboard")
+            hashes.append(source_hash)
+        else:
+            source_asset = manifest_by_filename.get(str(source_filename))
+            expected_role = role_by_filename.get(str(source_filename))
+            if not isinstance(source_hash, str) or source_asset is None or source_asset.get("sha256") != source_hash:
+                errors.append(f"reference_assets[{index}] 未绑定匹配的客户素材文件和哈希")
+            elif expected_role is None or asset_role != expected_role:
+                errors.append(f"reference_assets[{index}].asset_role 与 visual-plan 不一致")
+            elif asset_role in {"Box Master", "Sachet Master", "Bottle Master"} and str(source_filename) not in identity_sources:
+                errors.append(f"reference_assets[{index}] 的产品主素材不在 product_identity_sources 中")
+            else:
+                hashes.append(source_hash)
+        if not item.get("reference_description"):
+            errors.append(f"reference_assets[{index}].reference_description 不能为空")
+    if len(names) != len(set(names)):
+        errors.append("reference_assets.mention_name 不得重复")
+    if aggregate_sha256 not in hashes:
+        errors.append("reference_assets 必须包含锁定的聚合 Storyboard")
+    if "<Picture" in prompt_text:
+        errors.append("R2V H3 prompt 不得残留 <Picture N>")
+    if errors:
+        raise WorkflowError("task-preview 校验失败: " + "; ".join(errors))
+    return assets
+
+
+def finalize_production_v4(run_dir: Path, state_path: Path, state: dict[str, Any]) -> dict[str, Any]:
+    if state.get("stage") != "storyboard_locked":
+        raise WorkflowError("schema v4 的 finalize-production 只能在 storyboard_locked 阶段执行")
+    lock = state.get("approvals", {}).get("storyboard")
+    if not lock or lock.get("audit", {}).get("create_task_authorized") is not True:
+        raise WorkflowError("缺少授权创建一次视频任务的有效 Storyboard 锁")
+    storyboard = storyboard_package_entry(state, lock["storyboard_revision"])
+    storyboard_payload = read_json_artifact(storyboard, "storyboard-package")
+    if storyboard["sha256"] != lock["storyboard_package_sha256"]:
+        raise WorkflowError("锁定 Storyboard 哈希与当前包不一致")
+    h3_prompt = artifact_entry(state, "h3-prompt")
+    required_lock = {
+        "storyboard_lock_id": lock["lock_id"],
+        "storyboard_revision": lock["storyboard_revision"],
+        "storyboard_package_sha256": lock["storyboard_package_sha256"],
+        "script_lock_id": lock["script_lock_id"],
+        "candidate_id": lock["candidate_id"],
+    }
+    for field, expected in required_lock.items():
+        if h3_prompt.get(field) != expected:
+            raise WorkflowError(f"h3-prompt.{field} 未绑定当前 Storyboard 锁")
+    validation = artifact_entry(state, "h3-validation")
+    validation_payload = read_json_artifact(validation, "h3-validation")
+    if not validation_payload.get("valid") or validation_payload.get("prompt_sha256") != h3_prompt.get("sha256") or validation_payload.get("mode") != "ref2va":
+        raise WorkflowError("H3 prompt 缺少匹配的 Ref2VA 成功校验")
+    prompt_text = verify_artifact_integrity(h3_prompt, "h3-prompt").read_text(encoding="utf-8-sig").strip()
+    preview = artifact_entry(state, "task-preview")
+    preview_payload = read_json_artifact(preview, "task-preview")
+    manifest = json.loads((run_dir.resolve() / "manifest.json").read_text(encoding="utf-8"))
+    aggregate_sha = storyboard_payload["components"]["aggregate_keyframe"]["sha256"]
+    visual_plan = read_json_artifact(storyboard_payload["components"]["visual_plan"], "visual-plan")
+    reference_assets = validate_v4_task_preview(preview_payload, prompt_text, aggregate_sha, manifest.get("assets", []), visual_plan)
+    used_idempotency_keys = {
+        read_json_artifact(entry, "production-package").get("idempotency_key")
+        for entry in state.get("artifacts", {}).get("production-package", [])
+    }
+    if preview_payload.get("idempotency_key") in used_idempotency_keys:
+        raise WorkflowError("新的生产意图必须使用从未使用过的 idempotency_key")
+    retry = state.get("active_retry")
+    if retry:
+        if preview.get("retry_authorization_version") != retry["authorization_version"]:
+            raise WorkflowError("显式重试必须记录新的 task-preview")
+        if preview_payload.get("idempotency_key") == retry.get("prior_idempotency_key"):
+            raise WorkflowError("显式重试必须使用新的 idempotency_key")
+    required_binding = {**required_lock, "h3_prompt_version": h3_prompt["version"]}
+    for field, expected in required_binding.items():
+        if preview_payload.get(field) != expected:
+            raise WorkflowError(f"task-preview.{field} 未绑定锁定 Storyboard")
+    entries = state.setdefault("artifacts", {}).setdefault("production-package", [])
+    version = len(entries) + 1
+    destination = run_dir.resolve() / f"production-package-v{version:02d}.json"
+    payload = {"schema_version": 4, "production_package_version": version, **required_binding, "storyboard_package_version": storyboard["version"], "aggregate_keyframe": storyboard_payload["components"]["aggregate_keyframe"], "reference_assets": reference_assets, "h3_prompt": component_binding(h3_prompt), "h3_validation": component_binding(validation), "task_preview": component_binding(preview), "task_parameters": preview_payload, "idempotency_key": preview_payload["idempotency_key"], "created_at": now_iso()}
+    atomic_json_write(destination, payload)
+    timestamp = now_iso()
+    entry = {"version": version, "path": str(destination), "sha256": sha256_file(destination), "recorded_at": timestamp, **required_binding}
+    entries.append(entry)
+    state["stage"] = "production_ready"
+    state.pop("active_retry", None)
+    state["updated_at"] = timestamp
+    state.setdefault("history", []).append({"at": timestamp, "event": "production_finalized", "version": version, "storyboard_lock_id": lock["lock_id"]})
+    atomic_json_write(state_path, state)
+    return entry
+
+
 def finalize_production(run_dir: Path) -> dict[str, Any]:
     state_path, state = load_state(run_dir)
+    if schema_version(state) == 4:
+        return finalize_production_v4(run_dir, state_path, state)
     if schema_version(state) != 3 or state.get("stage") != "proposal_locked":
         raise WorkflowError("finalize-production 只能在 proposal_locked 阶段执行")
     lock = state.get("approvals", {}).get("proposal")
@@ -1174,6 +1760,33 @@ def finalize_production(run_dir: Path) -> dict[str, Any]:
 
 def authorize_retry(run_dir: Path, approval_json: Path) -> dict[str, Any]:
     state_path, state = load_state(run_dir)
+    if schema_version(state) == 4:
+        if state.get("stage") != "failed":
+            raise WorkflowError("authorize-retry 只能用于 schema v4 的 failed 阶段")
+        lock = state.get("approvals", {}).get("storyboard")
+        if not lock:
+            raise WorkflowError("显式重试缺少原 Storyboard 锁")
+        audit = read_json_file(approval_json, "retry approval")
+        if any(audit.get(field) in (None, "") for field in ("raw_reply", "confirmed_at", "channel")):
+            raise WorkflowError("重试审计必须包含 raw_reply、confirmed_at 和 channel")
+        if audit.get("retry_authorized") is not True:
+            raise WorkflowError("重试审计必须明确 retry_authorized: true")
+        entries = state.setdefault("artifacts", {}).setdefault("retry-authorization", [])
+        version = len(entries) + 1
+        destination = run_dir.resolve() / f"retry-authorization-v{version:02d}.json"
+        payload = sanitize_json({**audit, "storyboard_lock_id": lock["lock_id"], "prior_task_id": state.get("task", {}).get("task_id"), "retry_authorized": True})
+        atomic_json_write(destination, payload)
+        timestamp = now_iso()
+        entries.append({"version": version, "path": str(destination), "sha256": sha256_file(destination), "recorded_at": timestamp, "storyboard_lock_id": lock["lock_id"]})
+        prior = state.get("artifacts", {}).get("production-package", [])
+        prior_idempotency = read_json_artifact(prior[-1], "production-package").get("idempotency_key") if prior else None
+        state["active_retry"] = {"authorization_version": version, "prior_idempotency_key": prior_idempotency, "authorized_at": timestamp}
+        state["stage"] = "storyboard_locked"
+        state.pop("task", None)
+        state["updated_at"] = timestamp
+        state.setdefault("history", []).append({"at": timestamp, "event": "task_retry_authorized", "version": version, "storyboard_lock_id": lock["lock_id"]})
+        atomic_json_write(state_path, state)
+        return state
     if schema_version(state) != 3 or state.get("stage") != "failed":
         raise WorkflowError("authorize-retry 只能用于 schema v3 的 failed 阶段")
     lock = state.get("approvals", {}).get("proposal")
@@ -1212,6 +1825,8 @@ def approve_gate(
     candidate_id: str | None = None,
 ) -> dict[str, Any]:
     state_path, state = load_state(run_dir)
+    if schema_version(state) == 4:
+        raise WorkflowError("schema v4 使用 lock-script 和 lock-storyboard，不使用旧 Gate 审批")
     if schema_version(state) == 3:
         raise WorkflowError("schema v3 使用 finalize-proposal 和 lock-proposal，不使用旧 Gate 审批")
     expected_stage = {"script": "script_review", "keyframe": "keyframe_review", "task": "task_review"}[gate]
@@ -1294,7 +1909,23 @@ def approve_gate(
 
 def check_transition_preconditions(state: dict[str, Any], current: str, new_stage: str) -> None:
     approvals = state.get("approvals", {})
-    if schema_version(state) == 3 and current == "production_ready" and new_stage == "submitted":
+    if schema_version(state) == 4 and current == "script_locked" and new_stage == "storyboard_review":
+        if not approvals.get("script"):
+            raise WorkflowError("进入 storyboard_review 前必须存在 Final Script 锁")
+    elif schema_version(state) == 4 and current == "production_ready" and new_stage == "submitted":
+        lock = approvals.get("storyboard")
+        if not lock or lock.get("audit", {}).get("create_task_authorized") is not True:
+            raise WorkflowError("提交前必须存在授权创建任务的 Storyboard 锁")
+        binding = require_bound_request(state)
+        task_result = artifact_entry(state, "task-result")
+        verify_artifact_integrity(task_result, "task-result")
+        if task_result.get("storyboard_lock_id") != lock.get("lock_id"):
+            raise WorkflowError("最新任务结果不属于当前 Storyboard 锁")
+        if task_result.get("request_version") != binding["request"]["version"]:
+            raise WorkflowError("最新任务结果未绑定当前已校验请求")
+        if not state.get("task", {}).get("task_id"):
+            raise WorkflowError("进入 submitted 前必须记录当前任务的 task_id")
+    elif schema_version(state) == 3 and current == "production_ready" and new_stage == "submitted":
         lock = approvals.get("proposal")
         if not lock or lock.get("audit", {}).get("create_task_authorized") is not True:
             raise WorkflowError("提交前必须存在授权创建任务的提案锁")
@@ -1469,8 +2100,81 @@ def validate_v3_request_for_run(state: dict[str, Any], path: Path) -> dict[str, 
     }
 
 
+def validate_v4_request_for_run(state: dict[str, Any], path: Path) -> dict[str, Any]:
+    if state.get("stage") != "production_ready":
+        raise WorkflowError("schema v4 最终请求只能在 production_ready 阶段校验")
+    lock = state.get("approvals", {}).get("storyboard")
+    if not lock or lock.get("audit", {}).get("create_task_authorized") is not True:
+        raise WorkflowError("缺少创建一次视频任务的客户授权")
+    request_entry = artifact_entry(state, "request")
+    errors: list[str] = []
+    if Path(path).resolve() != Path(request_entry["path"]).resolve():
+        errors.append("必须校验最新记录的 request 产物")
+    try:
+        request = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"valid": False, "request_sha256": None, "errors": [f"request 必须是有效 JSON: {exc}"]}
+    production = artifact_entry(state, "production-package")
+    production_payload = read_json_artifact(production, "production-package")
+    preview_entry = artifact_entry(state, "task-preview", production_payload["task_preview"]["version"])
+    preview = read_json_artifact(preview_entry, "task-preview")
+    h3_prompt = artifact_entry(state, "h3-prompt", production_payload["h3_prompt"]["version"])
+    try:
+        errors.extend(load_console_validator().validate(request))
+    except (AttributeError, OSError) as exc:
+        raise WorkflowError(f"Console 请求校验器执行失败: {exc}") from exc
+    for field in ("workspace_id", "mode", "duration_seconds", "aspect_ratio", "quality", "execution_backend", "idempotency_key"):
+        if request.get(field) != preview.get(field):
+            errors.append(f"request.{field} 与 production package 不一致")
+    approved_prompt = verify_artifact_integrity(h3_prompt, "h3-prompt").read_text(encoding="utf-8-sig").strip()
+    if not isinstance(request.get("prompt"), str) or request["prompt"].strip() != approved_prompt:
+        errors.append("request.prompt 与 production package 中的 H3 prompt 不一致")
+    assets = request.get("assets")
+    requested_by_name = {
+        item.get("mention_name"): item for item in assets
+        if isinstance(assets, list) and isinstance(item, dict) and item.get("mention_name")
+    }
+    expected_assets = production_payload.get("reference_assets", [])
+    uploads: dict[str, dict[str, Any]] = {}
+    for entry in state.get("artifacts", {}).get("asset-upload", []):
+        payload = read_json_artifact(entry, "asset-upload")
+        if payload.get("storyboard_lock_id") == lock["lock_id"]:
+            uploads[payload.get("mention_name")] = payload
+    if not isinstance(assets, list) or len(assets) != len(expected_assets):
+        errors.append("R2V 请求素材数量与 production package 不一致")
+    for expected in expected_assets:
+        name = expected["mention_name"]
+        upload = uploads.get(name)
+        requested = requested_by_name.get(name)
+        if upload is None:
+            errors.append(f"缺少 @{name} 的 asset-upload 证据")
+            continue
+        if upload.get("source_sha256") != expected.get("source_sha256"):
+            errors.append(f"@{name} 的上传素材哈希与 production package 不一致")
+        if upload.get("source_filename") != expected.get("source_filename") or upload.get("asset_role") != expected.get("asset_role"):
+            errors.append(f"@{name} 的上传素材语义与 production package 不一致")
+        if requested is None:
+            errors.append(f"request 缺少 @{name} 素材")
+        elif requested.get("asset_id") != upload.get("asset_id") or requested.get("role") != "reference_image":
+            errors.append(f"request @{name} 未绑定已记录的 reference_image 上传结果")
+    return {
+        "valid": not errors,
+        "request_sha256": sha256_file(path),
+        "request_version": request_entry["version"],
+        "storyboard_lock_id": lock["lock_id"],
+        "storyboard_revision": lock["storyboard_revision"],
+        "storyboard_package_sha256": lock["storyboard_package_sha256"],
+        "production_package_version": production["version"],
+        "candidate_id": lock["candidate_id"],
+        "idempotency_key": request.get("idempotency_key"),
+        "errors": errors,
+    }
+
+
 def validate_request_for_run(run_dir: Path, path: Path) -> dict[str, Any]:
     _, state = load_state(run_dir)
+    if schema_version(state) == 4:
+        return validate_v4_request_for_run(state, path)
     if schema_version(state) == 3:
         return validate_v3_request_for_run(state, path)
     approval = state.get("approvals", {}).get("task")
@@ -1544,12 +2248,16 @@ def record_request_validation(run_dir: Path, result: dict[str, Any]) -> dict[str
     if not result.get("valid"):
         raise WorkflowError("不能记录失败的最终请求校验")
     state_path, state = load_state(run_dir)
-    approval = state.get("approvals", {}).get("proposal" if schema_version(state) == 3 else "task", {})
+    approval_key = "storyboard" if schema_version(state) == 4 else ("proposal" if schema_version(state) == 3 else "task")
+    approval = state.get("approvals", {}).get(approval_key, {})
     request = artifact_entry(state, "request")
     verify_artifact_integrity(request, "request")
     if result.get("request_sha256") != request.get("sha256"):
         raise WorkflowError("校验结果与最新 request 不匹配")
-    if schema_version(state) == 3:
+    if schema_version(state) == 4:
+        if result.get("storyboard_lock_id") != approval.get("lock_id"):
+            raise WorkflowError("校验结果不属于当前 Storyboard 锁")
+    elif schema_version(state) == 3:
         if result.get("proposal_lock_id") != approval.get("lock_id"):
             raise WorkflowError("校验结果不属于当前提案锁")
     elif result.get("intent_id") != approval.get("intent_id"):
@@ -1577,6 +2285,27 @@ def record_request_validation(run_dir: Path, result: dict[str, Any]) -> dict[str
 
 
 def require_bound_request(state: dict[str, Any]) -> dict[str, Any]:
+    if schema_version(state) == 4:
+        approval = state.get("approvals", {}).get("storyboard")
+        if not approval:
+            raise WorkflowError("缺少当前 Storyboard 锁")
+        request = artifact_entry(state, "request")
+        verify_artifact_integrity(request, "request")
+        validation = artifact_entry(state, "request-validation")
+        payload = read_json_artifact(validation, "request-validation")
+        production = artifact_entry(state, "production-package")
+        if not payload.get("valid") or payload.get("request_sha256") != request.get("sha256"):
+            raise WorkflowError("最新 request 没有匹配的成功校验记录")
+        expected = {
+            "storyboard_lock_id": approval["lock_id"],
+            "storyboard_revision": approval["storyboard_revision"],
+            "storyboard_package_sha256": approval["storyboard_package_sha256"],
+            "production_package_version": production["version"],
+        }
+        for field, value in expected.items():
+            if payload.get(field) != value:
+                raise WorkflowError(f"request 校验记录的 {field} 与生产包不一致")
+        return {"request": request, "validation": validation, "payload": payload}
     if schema_version(state) == 3:
         approval = state.get("approvals", {}).get("proposal")
         if not approval:
@@ -1635,9 +2364,86 @@ def record_artifact(
     schema = schema_version(state)
     is_v2 = schema == 2
     is_v3 = schema == 3
+    is_v4 = schema == 4
     selected_id: str | None = None
     binding: dict[str, Any] = {}
-    if is_v3:
+    if is_v4:
+        allowed_direct = {"script-proposal", "final-script", "visual-plan", "aggregate-keyframe-prompt", "aggregate-keyframe", "h3-prompt", "task-preview", "request", "asset-upload", "task-result"}
+        if kind not in allowed_direct:
+            raise WorkflowError(f"schema v4 的 {kind} 必须由专用命令生成")
+        if candidate_id is not None:
+            raise WorkflowError("schema v4 产物不接受 candidate-id；候选由锁定命令绑定")
+        stage = state.get("stage")
+        if kind == "script-proposal":
+            if stage != "script_review":
+                raise WorkflowError("script-proposal 只能在 script_review 阶段记录")
+            validate_script_proposal(source)
+        elif kind == "final-script":
+            if stage != "script_review":
+                raise WorkflowError("final-script 只能在 script_review 阶段记录")
+            package = script_package_entry(state)
+            binding.update({"script_revision": package["script_revision"], "script_package_version": package["version"], "script_package_sha256": package["sha256"]})
+            validate_final_script(source)
+        elif kind in {"visual-plan", "aggregate-keyframe-prompt", "aggregate-keyframe"}:
+            script_lock = state.get("approvals", {}).get("script")
+            if stage != "storyboard_review" or not script_lock:
+                raise WorkflowError(f"{kind} 只能在 Final Script 锁定后的 storyboard_review 阶段记录")
+            binding["script_lock_id"] = script_lock["lock_id"]
+            if kind == "visual-plan":
+                validate_visual_plan(source)
+            elif kind == "aggregate-keyframe":
+                if source.suffix.casefold() not in SUPPORTED_IMAGES:
+                    raise WorkflowError("aggregate-keyframe 必须是支持的图片格式")
+                prompt = artifact_entry(state, "aggregate-keyframe-prompt")
+                if prompt.get("script_lock_id") != script_lock["lock_id"]:
+                    raise WorkflowError("aggregate-keyframe-prompt 未绑定当前 script lock")
+                binding["keyframe_prompt_version"] = prompt["version"]
+        elif kind in {"h3-prompt", "task-preview"}:
+            lock = state.get("approvals", {}).get("storyboard")
+            if stage != "storyboard_locked" or not lock:
+                raise WorkflowError(f"{kind} 只能在 Storyboard 锁定后记录")
+            binding = {
+                "storyboard_lock_id": lock["lock_id"],
+                "storyboard_revision": lock["storyboard_revision"],
+                "storyboard_package_sha256": lock["storyboard_package_sha256"],
+                "script_lock_id": lock["script_lock_id"],
+                "candidate_id": lock["candidate_id"],
+            }
+            if kind == "task-preview":
+                payload = read_json_file(source, "task-preview")
+                for field, expected in binding.items():
+                    if payload.get(field) != expected:
+                        raise WorkflowError(f"task-preview.{field} 未绑定锁定 Storyboard")
+                h3 = artifact_entry(state, "h3-prompt")
+                if payload.get("h3_prompt_version") != h3["version"]:
+                    raise WorkflowError("task-preview.h3_prompt_version 未绑定最新 H3 prompt")
+                binding["h3_prompt_version"] = h3["version"]
+                if state.get("active_retry"):
+                    binding["retry_authorization_version"] = state["active_retry"]["authorization_version"]
+        elif kind == "request":
+            if stage != "production_ready":
+                raise WorkflowError("request 只能在 production_ready 阶段记录")
+        elif kind == "asset-upload":
+            if stage != "production_ready":
+                raise WorkflowError("asset-upload 只能在 production_ready 阶段记录")
+            upload = read_json_file(source, "asset-upload")
+            production = read_json_artifact(artifact_entry(state, "production-package"), "production-package")
+            expected_assets = {item["mention_name"]: item for item in production.get("reference_assets", [])}
+            name = upload.get("mention_name")
+            expected = expected_assets.get(name)
+            if expected is None:
+                raise WorkflowError("asset-upload.mention_name 不属于 production package")
+            if upload.get("storyboard_lock_id") != production["storyboard_lock_id"] or upload.get("source_sha256") != expected.get("source_sha256"):
+                raise WorkflowError("asset-upload 未绑定锁定 Storyboard 素材")
+            for field in ("source_filename", "asset_role"):
+                if upload.get(field) != expected.get(field):
+                    raise WorkflowError(f"asset-upload.{field} 与 production package 不一致")
+            if not is_uuid(upload.get("asset_id")):
+                raise WorkflowError("asset-upload.asset_id 必须是 UUID")
+            binding.update({"storyboard_lock_id": production["storyboard_lock_id"], "source_sha256": expected["source_sha256"], "source_filename": expected["source_filename"], "asset_role": expected["asset_role"], "mention_name": name, "asset_id": upload["asset_id"]})
+        elif kind == "task-result" and stage not in {"production_ready", "submitted", "monitoring"}:
+            raise WorkflowError("task-result 只能在已授权的生产或监控阶段记录")
+    elif is_v3:
         allowed_direct = {
             "script",
             "dimension-reference",
@@ -1748,7 +2554,10 @@ def record_artifact(
         raise WorkflowError("schema v1 产物不接受 candidate-id")
     request_binding: dict[str, Any] | None = None
     if kind == "task-result":
-        if is_v3:
+        if is_v4:
+            if "storyboard" not in state.get("approvals", {}):
+                raise WorkflowError("记录任务结果前必须锁定并授权 Storyboard")
+        elif is_v3:
             if "proposal" not in state.get("approvals", {}):
                 raise WorkflowError("记录任务结果前必须锁定并授权提案")
         elif "task" not in state.get("approvals", {}):
@@ -1763,11 +2572,11 @@ def record_artifact(
         raise WorkflowError(f"产物目标已存在: {destination}")
 
     sanitized_payload: Any = None
-    if kind == "task-result":
+    if kind in {"task-result", "asset-upload"}:
         try:
             payload = json.loads(source.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            raise WorkflowError(f"task-result 必须是有效 JSON: {exc}") from exc
+            raise WorkflowError(f"{kind} 必须是有效 JSON: {exc}") from exc
         sanitized_payload = sanitize_json(payload)
         atomic_json_write(destination, sanitized_payload)
     else:
@@ -1784,7 +2593,9 @@ def record_artifact(
         entry["candidate_id"] = selected_id
     entry.update(binding)
     if kind == "task-result" and request_binding is not None:
-        if is_v3:
+        if is_v4:
+            entry["storyboard_lock_id"] = request_binding["payload"]["storyboard_lock_id"]
+        elif is_v3:
             entry["proposal_lock_id"] = request_binding["payload"]["proposal_lock_id"]
         else:
             entry["intent_id"] = request_binding["payload"]["intent_id"]
@@ -1806,7 +2617,9 @@ def record_artifact(
         state["task"] = {
             key: sanitized_payload[key] for key in allowed_task_keys if key in sanitized_payload
         }
-        if is_v3:
+        if is_v4:
+            state["task"]["storyboard_lock_id"] = request_binding["payload"]["storyboard_lock_id"]
+        elif is_v3:
             state["task"]["proposal_lock_id"] = request_binding["payload"]["proposal_lock_id"]
         else:
             state["task"]["intent_id"] = request_binding["payload"]["intent_id"]
@@ -1877,14 +2690,11 @@ def validate_h3_prompt(path: Path, duration: float) -> dict[str, Any]:
     text = path.read_text(encoding="utf-8-sig").strip()
     errors: list[str] = []
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if not lines or lines[0] != I2VA_OPENING:
-        errors.append("I2VA 提示词必须以标准 0 秒首帧对齐语句开头")
-
-    fields = [
-        "integrated_multimodal_description:",
-        "overall_soundscape:",
-        "non_diegetic_music:",
-    ]
+    mode = "i2va" if lines and lines[0] == I2VA_OPENING else "ref2va"
+    if mode == "i2va":
+        fields = ["integrated_multimodal_description:", "overall_soundscape:", "non_diegetic_music:"]
+    else:
+        fields = ["subject_definitions:", "summary:", "retention_analysis:", "detailed_description:", "overall_soundscape:", "non_diegetic_music:"]
     positions = [text.find(field) for field in fields]
     if any(position < 0 for position in positions):
         errors.append("提示词缺少 H3 必需字段")
@@ -1900,6 +2710,7 @@ def validate_h3_prompt(path: Path, duration: float) -> dict[str, Any]:
         errors.append("镜头切点必须大于 0 且小于视频总时长")
     return {
         "valid": not errors,
+        "mode": mode,
         "prompt_sha256": sha256_file(path),
         "duration_seconds": duration,
         "cut_times": times,
@@ -1976,7 +2787,7 @@ def build_parser() -> argparse.ArgumentParser:
     record_parser.add_argument("--source", required=True, type=Path)
     record_parser.add_argument("--candidate-id", choices=CANDIDATE_IDS)
 
-    prompt_parser = subparsers.add_parser("validate-h3-prompt", help="Validate the final I2VA prompt structure")
+    prompt_parser = subparsers.add_parser("validate-h3-prompt", help="Validate the final I2VA or Ref2VA prompt structure")
     prompt_parser.add_argument("prompt", type=Path)
     prompt_parser.add_argument("--duration", type=float, default=15)
     prompt_parser.add_argument("--run-dir", type=Path)
@@ -1985,10 +2796,36 @@ def build_parser() -> argparse.ArgumentParser:
     request_parser.add_argument("request", type=Path)
     request_parser.add_argument("--run-dir", required=True, type=Path)
 
-    feedback_parser = subparsers.add_parser("record-feedback", help="Append client feedback for a proposal revision")
+    feedback_parser = subparsers.add_parser("record-feedback", help="Append client feedback for a revision")
     feedback_parser.add_argument("run_dir", type=Path)
-    feedback_parser.add_argument("--proposal-version", required=True, type=int)
+    feedback_parser.add_argument("--proposal-version", type=int, help="Schema v3 proposal revision")
+    feedback_parser.add_argument("--base-revision", type=int, help="Schema v4 phase revision")
+    feedback_parser.add_argument("--phase", choices=["script", "storyboard"])
     feedback_parser.add_argument("--source", required=True, type=Path)
+
+    script_proposal_parser = subparsers.add_parser("finalize-script-proposal", help="Publish an immutable five-script package")
+    script_proposal_parser.add_argument("run_dir", type=Path)
+    script_proposal_parser.add_argument("--script-version", required=True, type=int)
+    script_proposal_parser.add_argument("--base-revision", type=int)
+
+    script_lock_parser = subparsers.add_parser("lock-script", help="Lock one final script")
+    script_lock_parser.add_argument("run_dir", type=Path)
+    script_lock_parser.add_argument("--script-proposal-version", required=True, type=int)
+    script_lock_parser.add_argument("--candidate-id", required=True, choices=CANDIDATE_IDS)
+    script_lock_parser.add_argument("--final-script-version", required=True, type=int)
+    script_lock_parser.add_argument("--approval-json", required=True, type=Path)
+
+    storyboard_parser = subparsers.add_parser("finalize-storyboard", help="Publish an immutable aggregate Storyboard package")
+    storyboard_parser.add_argument("run_dir", type=Path)
+    storyboard_parser.add_argument("--visual-plan-version", required=True, type=int)
+    storyboard_parser.add_argument("--keyframe-prompt-version", required=True, type=int)
+    storyboard_parser.add_argument("--keyframe-version", required=True, type=int)
+    storyboard_parser.add_argument("--base-revision", type=int)
+
+    storyboard_lock_parser = subparsers.add_parser("lock-storyboard", help="Lock Storyboard and authorize one task")
+    storyboard_lock_parser.add_argument("run_dir", type=Path)
+    storyboard_lock_parser.add_argument("--storyboard-version", required=True, type=int)
+    storyboard_lock_parser.add_argument("--approval-json", required=True, type=Path)
 
     proposal_parser = subparsers.add_parser("finalize-proposal", help="Publish an immutable proposal package")
     proposal_parser.add_argument("run_dir", type=Path)
@@ -2007,10 +2844,11 @@ def build_parser() -> argparse.ArgumentParser:
     production_parser = subparsers.add_parser("finalize-production", help="Bind the locked proposal into an H3 production package")
     production_parser.add_argument("run_dir", type=Path)
 
-    revision_parser = subparsers.add_parser("begin-revision", help="Start a proposal revision from client feedback")
+    revision_parser = subparsers.add_parser("begin-revision", help="Start a revision from client feedback")
     revision_parser.add_argument("run_dir", type=Path)
     revision_parser.add_argument("--base-revision", required=True, type=int)
     revision_parser.add_argument("--feedback-version", required=True, type=int)
+    revision_parser.add_argument("--phase", choices=["script", "storyboard"])
 
     retry_parser = subparsers.add_parser("authorize-retry", help="Record explicit client authorization for one failed-task retry")
     retry_parser.add_argument("run_dir", type=Path)
@@ -2051,7 +2889,18 @@ def main() -> int:
                 return 1
             result["recorded_artifact"] = record_request_validation(args.run_dir, result)
         elif args.command == "record-feedback":
-            result = record_feedback(args.run_dir, args.proposal_version, args.source)
+            revision = args.base_revision if args.base_revision is not None else args.proposal_version
+            if revision is None:
+                raise WorkflowError("record-feedback 必须提供 --proposal-version 或 --base-revision")
+            result = record_feedback(args.run_dir, revision, args.source, args.phase)
+        elif args.command == "finalize-script-proposal":
+            result = finalize_script_proposal(args.run_dir, args.script_version, args.base_revision)
+        elif args.command == "lock-script":
+            result = lock_script(args.run_dir, args.script_proposal_version, args.candidate_id, args.final_script_version, args.approval_json)
+        elif args.command == "finalize-storyboard":
+            result = finalize_storyboard(args.run_dir, args.visual_plan_version, args.keyframe_prompt_version, args.keyframe_version, args.base_revision)
+        elif args.command == "lock-storyboard":
+            result = lock_storyboard(args.run_dir, args.storyboard_version, args.approval_json)
         elif args.command == "finalize-proposal":
             result = finalize_proposal(args.run_dir, args.script_version, args.dimension_version, args.dimension_image_version, args.keyframe_version, args.base_revision)
         elif args.command == "lock-proposal":
@@ -2059,7 +2908,7 @@ def main() -> int:
         elif args.command == "finalize-production":
             result = finalize_production(args.run_dir)
         elif args.command == "begin-revision":
-            result = begin_revision(args.run_dir, args.base_revision, args.feedback_version)
+            result = begin_revision(args.run_dir, args.base_revision, args.feedback_version, args.phase)
         elif args.command == "authorize-retry":
             result = authorize_retry(args.run_dir, args.approval_json)
         else:
