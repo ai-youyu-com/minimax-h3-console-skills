@@ -1,7 +1,7 @@
 interface:
   display_name: "Generate Client Ad Video"
-  short_description: "Lock five-script, Storyboard, and R2V production stages"
-  default_prompt: "Use $generate-client-ad-video to build five script options, lock one Final Script, confirm one aggregate Storyboard, and create one authorized R2V H3 task."
+  short_description: "快速生成五案、分镜与一个H3广告视频任务"
+  default_prompt: "Use $generate-client-ad-video in Fast Mode to create five concise directions, one approved Storyboard, and one authorized H3 video task."
 dependencies:
   tools:
     - type: "mcp"

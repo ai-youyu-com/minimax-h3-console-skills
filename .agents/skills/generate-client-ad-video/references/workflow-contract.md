@@ -1,4 +1,6 @@
-# Workflow Contract
+# Audit Mode Workflow Contract
+
+This contract applies only when the user explicitly requests Audit Mode or when resuming an existing schema v1-v4 audit run. New ordinary ad-video requests use the speed-first Fast Mode in `SKILL.md` and do not load or execute this contract.
 
 ## Delegation
 
